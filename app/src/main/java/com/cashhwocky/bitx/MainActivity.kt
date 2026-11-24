@@ -53,7 +53,11 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.annotation.OptIn
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
@@ -90,8 +94,7 @@ enum class BitXTab(
 ) {
     HOME("Home", Icons.Filled.Home, Icons.Outlined.Home),
     SEARCH("Search", Icons.Filled.Search, Icons.Outlined.Search),
-    SAVED("Saved", Icons.Filled.Bookmark, Icons.Outlined.BookmarkBorder),
-    CLIPS("Clips", Icons.Filled.PlayCircle, Icons.Outlined.PlayCircleOutline)
+    SAVED("Saved", Icons.Filled.Bookmark, Icons.Outlined.BookmarkBorder)
 }
 
 object SavedPostsStore {
@@ -213,7 +216,7 @@ object XApiClient {
             resolveQueryIds(authToken, ct0)
 
             val (opName, varsJson) = when (tab) {
-                BitXTab.HOME, BitXTab.CLIPS -> {
+                BitXTab.HOME -> {
                     val op = if (queryIdCache.containsKey("HomeTimeline")) "HomeTimeline" else "HomeLatestTimeline"
                     op to """{"count":30,"includePromotedContent":false,"latestControlAvailable":true}"""
                 }
@@ -249,12 +252,7 @@ object XApiClient {
                     return@withContext Result.failure(Exception("HTTP ${resp.code}: ${body.take(120)}"))
                 }
                 val parsed = parseTweetsDeep(body)
-                val finalTweets = if (tab == BitXTab.CLIPS) {
-                    val videosOnly = parsed.filter { !it.videoUrl.isNullOrBlank() }
-                    if (videosOnly.isNotEmpty()) videosOnly else parsed.filter { it.mediaUrls.isNotEmpty() }
-                } else {
-                    parsed
-                }
+                val finalTweets = parsed
                 Result.success(finalTweets)
             }
         } catch (e: Exception) {
@@ -538,6 +536,7 @@ fun XNativeAuthScreen(
     }
 }
 
+@OptIn(UnstableApi::class)
 @Composable
 fun NativeVideoPlayer(
     videoUrl: String,
@@ -546,12 +545,18 @@ fun NativeVideoPlayer(
 ) {
     val context = LocalContext.current
     val exoPlayer = remember(videoUrl) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(videoUrl))
-            repeatMode = Player.REPEAT_MODE_ONE
-            prepare()
-            playWhenReady = autoPlay
-        }
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setUserAgent("Mozilla/5.0 (Linux; Android 15; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36")
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(httpFactory))
+            .build().apply {
+                setMediaItem(MediaItem.fromUri(videoUrl))
+                repeatMode = Player.REPEAT_MODE_ONE
+                volume = 1f
+                prepare()
+                playWhenReady = autoPlay
+            }
     }
 
     LaunchedEffect(autoPlay) {
@@ -827,61 +832,6 @@ fun NativeBitXApp(
                                 Text(errorMsg!!, color = colors.onErrorContainer, fontSize = 13.sp)
                                 Spacer(modifier = Modifier.height(14.dp))
                                 Button(onClick = { loadTab(selectedTab) }) { Text("Retry") }
-                            }
-                        }
-                    }
-                    selectedTab == BitXTab.CLIPS -> {
-                        if (tweets.isEmpty()) {
-                            Text("No clips found right now.", color = colors.onSurfaceVariant, modifier = Modifier.align(Alignment.Center))
-                        } else {
-                            val pagerState = rememberPagerState(pageCount = { tweets.size })
-                            VerticalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-                                val clip = tweets[page]
-                                val isCurrent = pagerState.currentPage == page
-                                Box(modifier = Modifier.fillMaxSize().padding(bottom = 90.dp)) {
-                                    if (!clip.videoUrl.isNullOrBlank()) {
-                                        NativeVideoPlayer(
-                                            videoUrl = clip.videoUrl,
-                                            autoPlay = isCurrent,
-                                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(28.dp))
-                                        )
-                                    } else {
-                                        AsyncImage(
-                                            model = clip.mediaUrl,
-                                            contentDescription = null,
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(28.dp))
-                                        )
-                                    }
-                                    Surface(
-                                        color = colors.surfaceContainerHigh.copy(alpha = 0.85f),
-                                        shape = RoundedCornerShape(24.dp),
-                                        modifier = Modifier
-                                            .align(Alignment.BottomStart)
-                                            .padding(16.dp)
-                                            .fillMaxWidth()
-                                            .clickable { activeCommentsTweet = clip }
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(14.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text("${clip.authorName} ${clip.handle}", color = colors.primary, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                                Spacer(modifier = Modifier.height(4.dp))
-                                                Text(clip.text, color = colors.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                            }
-                                            IconButton(onClick = { toggleSavePost(clip) }) {
-                                                val saved = savedIdSet.contains(clip.id)
-                                                Icon(
-                                                    imageVector = if (saved) Icons.Filled.Bookmark else Icons.Outlined.BookmarkBorder,
-                                                    contentDescription = "Save",
-                                                    tint = if (saved) colors.primary else colors.onSurfaceVariant
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -1416,7 +1366,7 @@ fun MaterialYouTweetCard(
                 } else if (!tweet.videoUrl.isNullOrBlank()) {
                     NativeVideoPlayer(
                         videoUrl = tweet.videoUrl,
-                        autoPlay = false,
+                        autoPlay = true,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(260.dp)
@@ -1497,3 +1447,4 @@ fun StatPill(
         }
     }
 }
+
