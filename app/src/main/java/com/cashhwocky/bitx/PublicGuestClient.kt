@@ -11,6 +11,7 @@ import java.net.URLEncoder
 object PublicGuestClient {
     private val client = OkHttpClient()
     private const val UA = "bitX/2.0 (Android; +https://github.com/cashhwocky/bitX)"
+    private var homeRefreshCount = 0
 
     private fun stripHtml(html: String, stripTrailingUrls: Boolean): String {
         var text = html
@@ -29,53 +30,20 @@ object PublicGuestClient {
         return text
     }
 
-    private fun isDirectVideoUrl(url: String?): Boolean {
+    private fun isVideoUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val lower = url.lowercase().substringBefore("?")
         return lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mov") || lower.endsWith(".m3u8")
     }
 
-    private fun toPlayableEmbedUrl(rawUrl: String): String {
-        // Convert YouTube watch/shorts/youtu.be URLs into clean embeddable player URLs
-        val ytId = Regex("""(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([a-zA-Z0-9_-]{11})""")
-            .find(rawUrl)?.groupValues?.getOrNull(1)
-        if (ytId != null) {
-            return "https://www.youtube.com/embed/$ytId?autoplay=1&playsinline=1"
-        }
-        // Convert PeerTube /w/ID or /videos/watch/ID to /videos/embed/ID
-        if (rawUrl.contains("/videos/watch/")) {
-            return rawUrl.replace("/videos/watch/", "/videos/embed/")
-        }
-        val ptMatch = Regex("""^(https?://[^/]+)/w/([a-zA-Z0-9_-]+)""").find(rawUrl)
-        if (ptMatch != null) {
-            return "${ptMatch.groupValues[1]}/videos/embed/${ptMatch.groupValues[2]}"
-        }
-        return rawUrl
-    }
-
-    private fun looksLikeVideoLink(url: String): Boolean {
-        val l = url.lowercase()
-        return l.contains("youtube.com") ||
-            l.contains("youtu.be") ||
-            l.contains("vimeo.com") ||
-            l.contains("peertube") ||
-            l.contains("/videos/watch/") ||
-            l.contains("/videos/embed/") ||
-            l.contains("/w/") ||
-            l.contains("streamable.com") ||
-            l.contains("redgifs.com") ||
-            l.contains("tiktok.com") ||
-            l.contains("twitch.tv") ||
-            l.contains("dailymotion.com")
-    }
-
-    private fun parseStatus(item: JSONObject, fallbackId: String): NativeTweet? {
+    private fun parseStatus(rawItem: JSONObject, fallbackId: String): NativeTweet? {
+        // Unwrap boosts/reblogs so media_attachments are never missed
+        val item = rawItem.optJSONObject("reblog") ?: rawItem
         val account = item.optJSONObject("account") ?: return null
-        val rawHtml = item.optString("content", "")
         val mediaList = mutableListOf<String>()
         var isVideo = false
         var videoUrl: String? = null
-        var embedVideoUrl: String? = null
+        var externalUrl: String? = null
 
         val mediaArr = item.optJSONArray("media_attachments")
         if (mediaArr != null) {
@@ -85,61 +53,42 @@ object PublicGuestClient {
                 val directUrl = m.optString("url").takeIf { it.isNotBlank() && it != "null" }
                 val remoteUrl = m.optString("remote_url").takeIf { it.isNotBlank() && it != "null" }
                 val previewUrl = m.optString("preview_url").takeIf { it.isNotBlank() && it != "null" }
-                val resolvedUrl = directUrl ?: remoteUrl
 
-                if (type in listOf("video", "gifv") || isDirectVideoUrl(resolvedUrl) || isDirectVideoUrl(remoteUrl)) {
+                val chosenVideo = when {
+                    isVideoUrl(directUrl) -> directUrl
+                    isVideoUrl(remoteUrl) -> remoteUrl
+                    type in listOf("video", "gifv") -> directUrl ?: remoteUrl
+                    else -> null
+                }
+
+                if (chosenVideo != null) {
                     isVideo = true
-                    if (videoUrl == null) {
-                        videoUrl = if (isDirectVideoUrl(resolvedUrl)) resolvedUrl
-                        else if (isDirectVideoUrl(remoteUrl)) remoteUrl
-                        else resolvedUrl
-                    }
+                    if (videoUrl == null) videoUrl = chosenVideo
                     if (previewUrl != null) mediaList.add(previewUrl)
                 } else {
-                    val bestImg = resolvedUrl ?: previewUrl
+                    val bestImg = directUrl ?: remoteUrl ?: previewUrl
                     if (bestImg != null) mediaList.add(bestImg)
                 }
             }
         }
 
-        // Check Mastodon link preview card (iframe html or video URL)
+        // Check link preview card (treated as external website link with warning popup)
         val card = item.optJSONObject("card")
         if (card != null && videoUrl == null) {
-            val cardType = card.optString("type").lowercase()
             val cardUrl = card.optString("url").takeIf { it.isNotBlank() && it != "null" }
-            val cardHtml = card.optString("html", "")
             val cardImg = card.optString("image").takeIf { it.isNotBlank() && it != "null" }
             if (cardImg != null && mediaList.isEmpty()) mediaList.add(cardImg)
-
-            val iframeSrc = Regex("""src=["'](https?://[^"']+)["']""").find(cardHtml)?.groupValues?.getOrNull(1)
-            if (iframeSrc != null) {
-                isVideo = true
-                embedVideoUrl = iframeSrc
-            } else if (cardUrl != null && (cardType == "video" || looksLikeVideoLink(cardUrl))) {
-                isVideo = true
-                embedVideoUrl = toPlayableEmbedUrl(cardUrl)
-            }
-        }
-
-        // Also scan links inside post HTML in case card was omitted
-        if (videoUrl == null && embedVideoUrl == null) {
-            val hrefs = Regex("""href=["'](https?://[^"']+)["']""").findAll(rawHtml).map { it.groupValues[1] }
-            for (href in hrefs) {
-                if (isDirectVideoUrl(href)) {
+            if (cardUrl != null) {
+                externalUrl = cardUrl
+                val cardType = card.optString("type").lowercase()
+                if (cardType == "video" || cardUrl.contains("youtube.com") || cardUrl.contains("youtu.be") || cardUrl.contains("vimeo.com") || cardUrl.contains("redgifs.com")) {
                     isVideo = true
-                    videoUrl = href
-                    break
-                } else if (looksLikeVideoLink(href)) {
-                    isVideo = true
-                    embedVideoUrl = toPlayableEmbedUrl(href)
-                    break
                 }
             }
         }
 
-        val hasAnyMedia = mediaList.isNotEmpty() || videoUrl != null || embedVideoUrl != null
-        val text = stripHtml(rawHtml, stripTrailingUrls = hasAnyMedia)
-        if (text.isBlank() && !hasAnyMedia) return null
+        val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty() || videoUrl != null)
+        if (text.isBlank() && mediaList.isEmpty() && videoUrl == null) return null
 
         return NativeTweet(
             id = item.optString("id", fallbackId),
@@ -150,7 +99,7 @@ object PublicGuestClient {
             mediaUrl = mediaList.firstOrNull(),
             mediaUrls = mediaList,
             videoUrl = videoUrl,
-            embedVideoUrl = embedVideoUrl,
+            externalUrl = externalUrl,
             likes = item.optInt("favourites_count", 0),
             retweets = item.optInt("reblogs_count", 0),
             replies = item.optInt("replies_count", 0),
@@ -160,10 +109,17 @@ object PublicGuestClient {
         )
     }
 
-    suspend fun fetchFeed(tab: BitXTab, query: String = ""): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
+    suspend fun fetchFeed(tab: BitXTab, query: String = "", forceFresh: Boolean = false): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
             val url = when (tab) {
-                BitXTab.HOME -> "https://mastodon.social/api/v1/trends/statuses?limit=30"
+                BitXTab.HOME -> {
+                    if (forceFresh) homeRefreshCount++
+                    when (homeRefreshCount % 3) {
+                        0 -> "https://mastodon.social/api/v1/trends/statuses?limit=30"
+                        1 -> "https://mastodon.social/api/v1/timelines/public?limit=30"
+                        else -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=30"
+                    }
+                }
                 BitXTab.SAVED -> return@withContext Result.success(emptyList())
                 BitXTab.SEARCH -> {
                     val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
@@ -190,7 +146,8 @@ object PublicGuestClient {
                     val item = arr.optJSONObject(i) ?: continue
                     parseStatus(item, i.toString())?.let { list.add(it) }
                 }
-                Result.success(list)
+                val final = if (forceFresh && tab == BitXTab.HOME) list.shuffled() else list
+                Result.success(final)
             }
         } catch (e: Exception) {
             Result.failure(e)

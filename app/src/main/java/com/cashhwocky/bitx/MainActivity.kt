@@ -2,7 +2,9 @@ package com.cashhwocky.bitx
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color as AndroidColor
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
@@ -18,6 +20,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -32,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -39,18 +44,22 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -78,7 +87,7 @@ data class NativeTweet(
     val mediaUrl: String?,
     val mediaUrls: List<String> = listOfNotNull(mediaUrl),
     val videoUrl: String? = null,
-    val embedVideoUrl: String? = null,
+    val externalUrl: String? = null,
     val likes: Int,
     val retweets: Int,
     val replies: Int,
@@ -123,7 +132,7 @@ object SavedPostsStore {
                         mediaUrl = o.optString("mediaUrl").takeIf { it.isNotBlank() },
                         mediaUrls = urls,
                         videoUrl = o.optString("videoUrl").takeIf { it.isNotBlank() },
-                        embedVideoUrl = o.optString("embedVideoUrl").takeIf { it.isNotBlank() },
+                        externalUrl = o.optString("externalUrl").takeIf { it.isNotBlank() },
                         likes = o.optInt("likes", 0),
                         retweets = o.optInt("retweets", 0),
                         replies = o.optInt("replies", 0),
@@ -151,7 +160,7 @@ object SavedPostsStore {
                 put("mediaUrl", t.mediaUrl ?: "")
                 put("mediaUrls", JSONArray(t.mediaUrls))
                 put("videoUrl", t.videoUrl ?: "")
-                put("embedVideoUrl", t.embedVideoUrl ?: "")
+                put("externalUrl", t.externalUrl ?: "")
                 put("likes", t.likes)
                 put("retweets", t.retweets)
                 put("replies", t.replies)
@@ -392,211 +401,47 @@ fun BitXRoot() {
     var allowNsfw by remember { mutableStateOf(prefs.getBoolean("allow_nsfw", false)) }
     var showLoginScreen by remember { mutableStateOf(false) }
 
-    val currentVersion = remember {
-        try {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.0.0"
-        } catch (_: Exception) { "2.0.0" }
-    }
-    var startupUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
-
-    // Check GitHub Releases automatically every time the app opens
-    LaunchedEffect(Unit) {
-        startupUpdate = UpdateManager.checkForUpdate(currentVersion)
-    }
-
     BitXMaterialYouTheme(amoledBlack = amoledBlack) {
-        Box(modifier = Modifier.fillMaxSize()) {
-            if (showLoginScreen) {
-                BackHandler { showLoginScreen = false }
-                XNativeAuthScreen(
-                    onAuthenticated = { token, csrf ->
-                        prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
-                        authToken = token
-                        ct0 = csrf
-                        showLoginScreen = false
-                    },
-                    onSkip = { showLoginScreen = false }
-                )
-            } else {
-                NativeBitXApp(
-                    authToken = authToken,
-                    ct0 = ct0,
-                    amoledBlack = amoledBlack,
-                    allowNsfw = allowNsfw,
-                    onToggleAmoled = { enabled ->
-                        amoledBlack = enabled
-                        prefs.edit().putBoolean("amoled_black", enabled).apply()
-                    },
-                    onToggleNsfw = { enabled ->
-                        allowNsfw = enabled
-                        prefs.edit().putBoolean("allow_nsfw", enabled).apply()
-                    },
-                    onOpenLogin = { showLoginScreen = true },
-                    onSaveManualCookies = { token, csrf ->
-                        prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
-                        authToken = token
-                        ct0 = csrf
-                        XApiClient.clearCache()
-                    },
-                    onLogout = {
-                        prefs.edit().remove("auth_token").remove("ct0").apply()
-                        CookieManager.getInstance().removeAllCookies(null)
-                        XApiClient.clearCache()
-                        authToken = null
-                        ct0 = null
-                    }
-                )
-            }
-
-            // Full-Screen Update Banner whenever a newer build exists on launch
-            if (startupUpdate != null) {
-                FullScreenUpdateBanner(
-                    currentVersion = currentVersion,
-                    updateInfo = startupUpdate!!,
-                    onDismiss = { startupUpdate = null }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun FullScreenUpdateBanner(
-    currentVersion: String,
-    updateInfo: UpdateInfo,
-    onDismiss: () -> Unit
-) {
-    val colors = MaterialTheme.colorScheme
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var downloading by remember { mutableStateOf(false) }
-    var failed by remember { mutableStateOf(false) }
-
-    BackHandler { if (!downloading) onDismiss() }
-
-    Surface(
-        color = colors.surface,
-        modifier = Modifier.fillMaxSize()
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 24.dp, vertical = 28.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Surface(
-                    color = colors.primaryContainer,
-                    shape = RoundedCornerShape(32.dp),
-                    modifier = Modifier.size(96.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Filled.SystemUpdate,
-                            contentDescription = null,
-                            tint = colors.onPrimaryContainer,
-                            modifier = Modifier.size(48.dp)
-                        )
-                    }
+        if (showLoginScreen) {
+            BackHandler { showLoginScreen = false }
+            XNativeAuthScreen(
+                onAuthenticated = { token, csrf ->
+                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                    authToken = token
+                    ct0 = csrf
+                    showLoginScreen = false
+                },
+                onSkip = { showLoginScreen = false }
+            )
+        } else {
+            NativeBitXApp(
+                authToken = authToken,
+                ct0 = ct0,
+                amoledBlack = amoledBlack,
+                allowNsfw = allowNsfw,
+                onToggleAmoled = { enabled ->
+                    amoledBlack = enabled
+                    prefs.edit().putBoolean("amoled_black", enabled).apply()
+                },
+                onToggleNsfw = { enabled ->
+                    allowNsfw = enabled
+                    prefs.edit().putBoolean("allow_nsfw", enabled).apply()
+                },
+                onOpenLogin = { showLoginScreen = true },
+                onSaveManualCookies = { token, csrf ->
+                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                    authToken = token
+                    ct0 = csrf
+                    XApiClient.clearCache()
+                },
+                onLogout = {
+                    prefs.edit().remove("auth_token").remove("ct0").apply()
+                    CookieManager.getInstance().removeAllCookies(null)
+                    XApiClient.clearCache()
+                    authToken = null
+                    ct0 = null
                 }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Text(
-                    text = "New bitX Update!",
-                    color = colors.onSurface,
-                    fontSize = 30.sp,
-                    fontWeight = FontWeight.Black,
-                    textAlign = TextAlign.Center
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Surface(
-                    color = colors.secondaryContainer,
-                    shape = CircleShape
-                ) {
-                    Text(
-                        text = "v$currentVersion  ->  v${updateInfo.versionTag}",
-                        color = colors.onSecondaryContainer,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                ElevatedCard(
-                    shape = RoundedCornerShape(24.dp),
-                    colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Text("What's New", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = updateInfo.notes,
-                            color = colors.onSurfaceVariant,
-                            fontSize = 14.sp,
-                            lineHeight = 20.sp
-                        )
-                    }
-                }
-
-                if (failed) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text("Download failed. Try again.", color = colors.error, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                }
-            }
-
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
-                    enabled = !downloading,
-                    onClick = {
-                        scope.launch {
-                            downloading = true
-                            failed = false
-                            val ok = UpdateManager.downloadAndInstall(context, updateInfo.apkUrl)
-                            if (!ok) failed = true
-                            downloading = false
-                        }
-                    },
-                    shape = RoundedCornerShape(22.dp),
-                    modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) {
-                    if (downloading) {
-                        CircularProgressIndicator(
-                            color = colors.onPrimary,
-                            strokeWidth = 2.5.dp,
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text("Downloading APK...", fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    } else {
-                        Icon(Icons.Filled.Download, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Update Now", fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-
-                FilledTonalButton(
-                    enabled = !downloading,
-                    onClick = onDismiss,
-                    shape = RoundedCornerShape(22.dp),
-                    modifier = Modifier.fillMaxWidth().height(50.dp)
-                ) {
-                    Text("Not Now", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
+            )
         }
     }
 }
@@ -704,6 +549,7 @@ fun XNativeAuthScreen(
 @Composable
 fun NativeVideoPlayer(
     videoUrl: String,
+    autoPlay: Boolean,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -718,8 +564,12 @@ fun NativeVideoPlayer(
                 repeatMode = Player.REPEAT_MODE_ONE
                 volume = 1f
                 prepare()
-                playWhenReady = true
+                playWhenReady = autoPlay
             }
+    }
+
+    LaunchedEffect(autoPlay) {
+        exoPlayer.playWhenReady = autoPlay
     }
 
     DisposableEffect(videoUrl) {
@@ -728,16 +578,158 @@ fun NativeVideoPlayer(
         }
     }
 
-    AndroidView(
-        modifier = modifier,
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                player = exoPlayer
-                useController = true
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
+    Box(modifier = modifier) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    player = exoPlayer
+                    useController = true
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                }
+            }
+        )
+        Surface(
+            color = Color.Black.copy(alpha = 0.65f),
+            shape = CircleShape,
+            modifier = Modifier.align(Alignment.TopEnd).padding(10.dp)
+        ) {
+            Text(
+                "VIDEO",
+                color = Color.White,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Black,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun ZoomableImageDialog(
+    imageUrl: String,
+    onDismiss: () -> Unit
+) {
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.96f))
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onDoubleTap = {
+                            if (scale > 1.2f) {
+                                scale = 1f
+                                offset = Offset.Zero
+                            } else {
+                                scale = 2.8f
+                            }
+                        }
+                    )
+                }
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                        scale = newScale
+                        offset = if (newScale > 1f) {
+                            Offset(offset.x + pan.x, offset.y + pan.y)
+                        } else {
+                            Offset.Zero
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            AsyncImage(
+                model = imageUrl,
+                contentDescription = "Zoomable Image",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offset.x,
+                        translationY = offset.y
+                    )
+            )
+
+            FilledTonalIconButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(16.dp)
+            ) {
+                Icon(Icons.Filled.Close, contentDescription = "Close")
+            }
+
+            Surface(
+                color = Color.Black.copy(alpha = 0.6f),
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(bottom = 20.dp)
+            ) {
+                Text(
+                    text = "Pinch or double-tap to zoom",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun ExternalRedirectWarningDialog(
+    url: String,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    AlertDialog(
+        onDismissRequest = onCancel,
+        icon = { Icon(Icons.Filled.Warning, contentDescription = null, tint = colors.error) },
+        title = { Text("Leaving bitX", fontWeight = FontWeight.ExtraBold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("This post links to an external website. Do you want to open it in your browser?")
+                Surface(
+                    color = colors.surfaceContainerHighest,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = url,
+                        color = colors.primary,
+                        fontSize = 12.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onConfirm) {
+                Text("Open Website")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) {
+                Text("Cancel")
             }
         }
     )
@@ -764,6 +756,8 @@ fun NativeBitXApp(
     var selectedTab by remember { mutableStateOf(BitXTab.HOME) }
     var showSettings by remember { mutableStateOf(false) }
     var activeCommentsTweet by remember { mutableStateOf<NativeTweet?>(null) }
+    var zoomedImageUrl by remember { mutableStateOf<String?>(null) }
+    var pendingRedirectUrl by remember { mutableStateOf<String?>(null) }
     var tweets by remember { mutableStateOf<List<NativeTweet>>(emptyList()) }
     var savedPosts by remember { mutableStateOf(SavedPostsStore.load(context)) }
     var isLoading by remember { mutableStateOf(false) }
@@ -783,7 +777,7 @@ fun NativeBitXApp(
         SavedPostsStore.save(context, updated)
     }
 
-    fun loadTab(tab: BitXTab, q: String = searchQuery) {
+    fun loadTab(tab: BitXTab, q: String = searchQuery, forceFresh: Boolean = false) {
         if (tab == BitXTab.SAVED) {
             isLoading = false
             errorMsg = null
@@ -801,7 +795,7 @@ fun NativeBitXApp(
             val result = if (isLoggedIn) {
                 XApiClient.fetchFeed(authToken!!, ct0!!, tab, q)
             } else {
-                PublicGuestClient.fetchFeed(tab, q)
+                PublicGuestClient.fetchFeed(tab, q, forceFresh = forceFresh)
             }
             result
                 .onSuccess { tweets = it }
@@ -831,6 +825,28 @@ fun NativeBitXApp(
         }
     }
 
+    if (zoomedImageUrl != null) {
+        ZoomableImageDialog(
+            imageUrl = zoomedImageUrl!!,
+            onDismiss = { zoomedImageUrl = null }
+        )
+    }
+
+    if (pendingRedirectUrl != null) {
+        val target = pendingRedirectUrl!!
+        ExternalRedirectWarningDialog(
+            url = target,
+            onCancel = { pendingRedirectUrl = null },
+            onConfirm = {
+                pendingRedirectUrl = null
+                try {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target))
+                    context.startActivity(intent)
+                } catch (_: Exception) {}
+            }
+        )
+    }
+
     if (activeCommentsTweet != null) {
         BackHandler { activeCommentsTweet = null }
         CommentsScreen(
@@ -838,6 +854,8 @@ fun NativeBitXApp(
             allowNsfw = allowNsfw,
             savedIds = savedPosts.map { it.id }.toSet(),
             onToggleSave = ::toggleSavePost,
+            onImageClick = { zoomedImageUrl = it },
+            onExternalLinkClick = { pendingRedirectUrl = it },
             onBack = { activeCommentsTweet = null }
         )
         return
@@ -854,7 +872,7 @@ fun NativeBitXApp(
             onClearCache = {
                 XApiClient.clearCache()
                 showSettings = false
-                loadTab(selectedTab)
+                loadTab(selectedTab, forceFresh = true)
             },
             onOpenLogin = {
                 showSettings = false
@@ -871,13 +889,6 @@ fun NativeBitXApp(
     }
 
     val savedIdSet = remember(savedPosts) { savedPosts.map { it.id }.toSet() }
-    val displayedTweets = remember(tweets, selectedTab, videosOnly) {
-        if (selectedTab == BitXTab.SEARCH && videosOnly) {
-            tweets.filter { it.isVideo || !it.videoUrl.isNullOrBlank() || !it.embedVideoUrl.isNullOrBlank() }
-        } else {
-            tweets
-        }
-    }
 
     Box(modifier = Modifier.fillMaxSize().background(colors.surface)) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -908,12 +919,13 @@ fun NativeBitXApp(
                         Text(selectedTab.label, color = colors.onSurface, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (isLoggedIn) {
-                            FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
-                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (selectedTab == BitXTab.HOME || (selectedTab == BitXTab.SEARCH && hasSearched)) {
+                            FilledTonalIconButton(onClick = { loadTab(selectedTab, forceFresh = true) }) {
+                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh Feed")
                             }
-                        } else {
+                        }
+                        if (!isLoggedIn) {
                             FilledTonalButton(onClick = onOpenLogin) {
                                 Text("Sign In", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                             }
@@ -946,7 +958,7 @@ fun NativeBitXApp(
                     FilterChip(
                         selected = videosOnly,
                         onClick = { videosOnly = !videosOnly },
-                        label = { Text("Videos Only") },
+                        label = { Text("Direct Videos Only") },
                         leadingIcon = if (videosOnly) {
                             { Icon(Icons.Filled.PlayCircle, contentDescription = null, modifier = Modifier.size(18.dp)) }
                         } else null
@@ -980,7 +992,9 @@ fun NativeBitXApp(
                                         allowNsfw = allowNsfw,
                                         isSaved = true,
                                         onToggleSave = { toggleSavePost(tweet) },
-                                        onOpenComments = { activeCommentsTweet = tweet }
+                                        onOpenComments = { activeCommentsTweet = tweet },
+                                        onImageClick = { zoomedImageUrl = it },
+                                        onExternalLinkClick = { pendingRedirectUrl = it }
                                     )
                                 }
                             }
@@ -1006,14 +1020,18 @@ fun NativeBitXApp(
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(errorMsg!!, color = colors.onErrorContainer, fontSize = 13.sp)
                                 Spacer(modifier = Modifier.height(14.dp))
-                                Button(onClick = { loadTab(selectedTab) }) { Text("Retry") }
+                                Button(onClick = { loadTab(selectedTab, forceFresh = true) }) { Text("Retry") }
                             }
                         }
                     }
                     else -> {
-                        if (displayedTweets.isEmpty()) {
+                        val displayed = if (selectedTab == BitXTab.SEARCH && videosOnly) {
+                            tweets.filter { !it.videoUrl.isNullOrBlank() }
+                        } else tweets
+
+                        if (displayed.isEmpty()) {
                             Text(
-                                text = if (videosOnly) "No playable videos in these results." else "No posts found.",
+                                text = if (videosOnly) "No direct video posts found for this tag." else "No posts found.",
                                 color = colors.onSurfaceVariant,
                                 modifier = Modifier.align(Alignment.Center)
                             )
@@ -1023,13 +1041,15 @@ fun NativeBitXApp(
                                 verticalArrangement = Arrangement.spacedBy(10.dp),
                                 modifier = Modifier.fillMaxSize()
                             ) {
-                                items(displayedTweets, key = { it.id }) { tweet ->
+                                items(displayed, key = { it.id }) { tweet ->
                                     MaterialYouTweetCard(
                                         tweet = tweet,
                                         allowNsfw = allowNsfw,
                                         isSaved = savedIdSet.contains(tweet.id),
                                         onToggleSave = { toggleSavePost(tweet) },
-                                        onOpenComments = { activeCommentsTweet = tweet }
+                                        onOpenComments = { activeCommentsTweet = tweet },
+                                        onImageClick = { zoomedImageUrl = it },
+                                        onExternalLinkClick = { pendingRedirectUrl = it }
                                     )
                                 }
                             }
@@ -1039,7 +1059,7 @@ fun NativeBitXApp(
             }
         }
 
-        // Floating Material You Pill Navigation Bar (Home, Search, Saved)
+        // Floating Material You Pill Navigation Bar
         Surface(
             color = colors.surfaceContainerHigh,
             tonalElevation = 8.dp,
@@ -1048,7 +1068,7 @@ fun NativeBitXApp(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 20.dp, vertical = 14.dp)
+                .padding(horizontal = 16.dp, vertical = 14.dp)
                 .fillMaxWidth()
         ) {
             Row(
@@ -1063,7 +1083,7 @@ fun NativeBitXApp(
                             .clip(CircleShape)
                             .background(if (selected) colors.primaryContainer else Color.Transparent)
                             .clickable { selectedTab = tab }
-                            .padding(horizontal = 18.dp, vertical = 10.dp),
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -1094,6 +1114,8 @@ fun CommentsScreen(
     allowNsfw: Boolean,
     savedIds: Set<String>,
     onToggleSave: (NativeTweet) -> Unit,
+    onImageClick: (String) -> Unit,
+    onExternalLinkClick: (String) -> Unit,
     onBack: () -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
@@ -1141,7 +1163,9 @@ fun CommentsScreen(
                     allowNsfw = allowNsfw,
                     isSaved = savedIds.contains(parentTweet.id),
                     onToggleSave = { onToggleSave(parentTweet) },
-                    onOpenComments = {}
+                    onOpenComments = {},
+                    onImageClick = onImageClick,
+                    onExternalLinkClick = onExternalLinkClick
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
@@ -1174,7 +1198,9 @@ fun CommentsScreen(
                         allowNsfw = allowNsfw,
                         isSaved = savedIds.contains(reply.id),
                         onToggleSave = { onToggleSave(reply) },
-                        onOpenComments = {}
+                        onOpenComments = {},
+                        onImageClick = onImageClick,
+                        onExternalLinkClick = onExternalLinkClick
                     )
                 }
             }
@@ -1460,29 +1486,26 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
                     Text("bitX", color = colors.onPrimaryContainer, fontWeight = FontWeight.Black, fontSize = 20.sp)
-                    Text("Version $currentVersion - Built by Alex Desrosier (@cashhwocky)", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
+                    Text("Version $currentVersion ? Built by Alex Desrosier (@cashhwocky)", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
                 }
             }
         }
     }
 }
 
-@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun MaterialYouTweetCard(
     tweet: NativeTweet,
     allowNsfw: Boolean,
     isSaved: Boolean,
     onToggleSave: () -> Unit,
-    onOpenComments: () -> Unit
+    onOpenComments: () -> Unit,
+    onImageClick: (String) -> Unit,
+    onExternalLinkClick: (String) -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
     var manuallyRevealed by remember(tweet.id) { mutableStateOf(false) }
-    var isPlayingVideo by remember(tweet.id) { mutableStateOf(false) }
     val showMedia = !tweet.isSensitive || allowNsfw || manuallyRevealed
-    val hasDirectVideo = !tweet.videoUrl.isNullOrBlank()
-    val hasEmbedVideo = !tweet.embedVideoUrl.isNullOrBlank()
-    val hasAnyMedia = hasDirectVideo || hasEmbedVideo || tweet.mediaUrls.isNotEmpty()
 
     ElevatedCard(
         shape = RoundedCornerShape(24.dp),
@@ -1522,7 +1545,7 @@ fun MaterialYouTweetCard(
                 Text(tweet.text, color = colors.onSurface, fontSize = 15.sp, lineHeight = 21.sp)
             }
 
-            if (hasAnyMedia) {
+            if (!tweet.videoUrl.isNullOrBlank() || tweet.mediaUrls.isNotEmpty() || !tweet.externalUrl.isNullOrBlank()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 if (!showMedia) {
                     Surface(
@@ -1547,83 +1570,62 @@ fun MaterialYouTweetCard(
                             Text("Tap to reveal (or enable NSFW in Settings)", color = colors.onSurfaceVariant, fontSize = 12.sp)
                         }
                     }
-                } else if (hasDirectVideo || hasEmbedVideo) {
-                    if (isPlayingVideo) {
-                        if (hasDirectVideo) {
-                            NativeVideoPlayer(
-                                videoUrl = tweet.videoUrl!!,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(260.dp)
-                                    .clip(RoundedCornerShape(18.dp))
+                } else if (!tweet.videoUrl.isNullOrBlank()) {
+                    NativeVideoPlayer(
+                        videoUrl = tweet.videoUrl,
+                        autoPlay = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                    )
+                } else if (!tweet.externalUrl.isNullOrBlank()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(220.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .clickable { onExternalLinkClick(tweet.externalUrl) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (tweet.mediaUrls.isNotEmpty()) {
+                            AsyncImage(
+                                model = tweet.mediaUrls.first(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
                             )
                         } else {
-                            AndroidView(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(260.dp)
-                                    .clip(RoundedCornerShape(18.dp)),
-                                factory = { ctx ->
-                                    WebView(ctx).apply {
-                                        layoutParams = ViewGroup.LayoutParams(
-                                            ViewGroup.LayoutParams.MATCH_PARENT,
-                                            ViewGroup.LayoutParams.MATCH_PARENT
-                                        )
-                                        settings.javaScriptEnabled = true
-                                        settings.domStorageEnabled = true
-                                        settings.mediaPlaybackRequiresUserGesture = false
-                                        webChromeClient = WebChromeClient()
-                                        webViewClient = WebViewClient()
-                                        loadUrl(tweet.embedVideoUrl!!)
-                                    }
-                                }
-                            )
+                            Box(modifier = Modifier.fillMaxSize().background(colors.surfaceContainerHighest))
                         }
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(240.dp)
-                                .clip(RoundedCornerShape(18.dp))
-                                .background(colors.surfaceContainerHighest)
-                                .clickable { isPlayingVideo = true },
-                            contentAlignment = Alignment.Center
+                        Surface(
+                            color = colors.secondaryContainer.copy(alpha = 0.92f),
+                            shape = CircleShape,
+                            shadowElevation = 6.dp
                         ) {
-                            if (tweet.mediaUrls.isNotEmpty()) {
-                                AsyncImage(
-                                    model = tweet.mediaUrls.first(),
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-                            Surface(
-                                color = colors.primaryContainer.copy(alpha = 0.94f),
-                                shape = CircleShape,
-                                shadowElevation = 6.dp
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Filled.PlayArrow, contentDescription = "Play", tint = colors.onPrimaryContainer)
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Play Video", color = colors.onPrimaryContainer, fontWeight = FontWeight.ExtraBold)
-                                }
+                                Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "External Link", tint = colors.onSecondaryContainer, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("External Link (Tap to Review)", color = colors.onSecondaryContainer, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             }
                         }
                     }
                 } else if (tweet.mediaUrls.size == 1) {
+                    val imgUrl = tweet.mediaUrls.first()
                     AsyncImage(
-                        model = tweet.mediaUrls.first(),
+                        model = imgUrl,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 180.dp, max = 320.dp)
                             .clip(RoundedCornerShape(18.dp))
+                            .clickable { onImageClick(imgUrl) }
                     )
-                } else {
+                } else if (tweet.mediaUrls.size > 1) {
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxWidth()
@@ -1637,6 +1639,7 @@ fun MaterialYouTweetCard(
                                     .width(260.dp)
                                     .height(220.dp)
                                     .clip(RoundedCornerShape(18.dp))
+                                    .clickable { onImageClick(url) }
                             )
                         }
                     }
