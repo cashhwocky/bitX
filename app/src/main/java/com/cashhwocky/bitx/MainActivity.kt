@@ -439,16 +439,15 @@ fun NativeBitXApp(
     var searchQuery by remember { mutableStateOf("") }
 
     fun loadTab(tab: BitXTab, q: String = searchQuery) {
-        if (!isLoggedIn) {
-            isLoading = false
-            errorMsg = null
-            tweets = emptyList()
-            return
-        }
         scope.launch {
             isLoading = true
             errorMsg = null
-            XApiClient.fetchFeed(authToken!!, ct0!!, tab, q)
+            val result = if (isLoggedIn) {
+                XApiClient.fetchFeed(authToken!!, ct0!!, tab, q)
+            } else {
+                PublicGuestClient.fetchFeed(tab, q)
+            }
+            result
                 .onSuccess { tweets = it }
                 .onFailure { errorMsg = it.message }
             isLoading = false
@@ -548,13 +547,7 @@ fun NativeBitXApp(
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when {
-                    !isLoggedIn -> {
-                        GuestModePlaceholder(
-                            tab = selectedTab,
-                            onSignIn = onOpenLogin,
-                            onOpenSettings = { showSettings = true }
-                        )
-                    }
+
                     isLoading -> {
                         CircularProgressIndicator(
                             modifier = Modifier.align(Alignment.Center),
@@ -1074,3 +1067,4 @@ fun StatPill(icon: ImageVector, count: Int) {
         }
     }
 }
+
