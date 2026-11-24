@@ -4,26 +4,46 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONObject
+import org.json.JSONArray
 import java.net.URLEncoder
 
 object PublicGuestClient {
     private val client = OkHttpClient()
 
+    private fun stripHtml(html: String): String {
+        return html
+            .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+            .replace(Regex("</p>", RegexOption.IGNORE_CASE), "\n\n")
+            .replace(Regex("<[^>]*>"), "")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .trim()
+    }
+
     suspend fun fetchFeed(tab: BitXTab, query: String = ""): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
-            val q = when (tab) {
-                BitXTab.SEARCH -> query.ifBlank { "trending" }
-                BitXTab.CLIPS -> "video OR clip"
-                BitXTab.SAVED -> "android OR pixel"
-                BitXTab.HOME -> "tech OR gaming OR music"
+            val url = when (tab) {
+                BitXTab.HOME -> "https://mastodon.social/api/v1/trends/statuses?limit=25"
+                BitXTab.CLIPS -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=25"
+                BitXTab.SAVED -> "https://mastodon.social/api/v1/timelines/tag/android?limit=25"
+                BitXTab.SEARCH -> {
+                    val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
+                    if (cleanTag.isBlank()) {
+                        "https://mastodon.social/api/v1/trends/statuses?limit=25"
+                    } else {
+                        val encoded = URLEncoder.encode(cleanTag, "UTF-8")
+                        "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=25"
+                    }
+                }
             }
-            val encoded = URLEncoder.encode(q, "UTF-8")
-            val url = "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=$encoded&limit=25"
 
             val req = Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
+                .header("User-Agent", "bitX/2.0 (Android; +https://github.com/cashhwocky/bitX)")
                 .build()
 
             client.newCall(req).execute().use { resp ->
@@ -31,31 +51,34 @@ object PublicGuestClient {
                 if (!resp.isSuccessful) {
                     return@withContext Result.failure(Exception("Public feed error: HTTP ${resp.code}"))
                 }
-                val root = JSONObject(body)
-                val posts = root.optJSONArray("posts") ?: return@withContext Result.success(emptyList())
+                val arr = JSONArray(body)
                 val list = mutableListOf<NativeTweet>()
 
-                for (i in 0 until posts.length()) {
-                    val p = posts.optJSONObject(i) ?: continue
-                    val author = p.optJSONObject("author") ?: continue
-                    val record = p.optJSONObject("record") ?: continue
-                    val embed = p.optJSONObject("embed")
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val account = item.optJSONObject("account") ?: continue
+                    val text = stripHtml(item.optString("content", ""))
+                    if (text.isBlank()) continue
 
-                    val imgUrl = embed?.optJSONArray("images")?.optJSONObject(0)?.optString("fullsize")
-                        ?: embed?.optString("thumbnail")?.takeIf { it.isNotBlank() }
+                    val mediaArr = item.optJSONArray("media_attachments")
+                    val firstMedia = mediaArr?.optJSONObject(0)
+                    val mediaUrl = firstMedia?.optString("preview_url")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: firstMedia?.optString("url")?.takeIf { it.isNotBlank() }
+                    val isVideo = firstMedia?.optString("type") in listOf("video", "gifv")
 
                     list.add(
                         NativeTweet(
-                            id = p.optString("uri", i.toString()),
-                            authorName = author.optString("displayName").ifBlank { author.optString("handle", "User") },
-                            handle = "@${author.optString("handle", "user")}",
-                            avatarUrl = author.optString("avatar", ""),
-                            text = record.optString("text", ""),
-                            mediaUrl = imgUrl,
-                            likes = p.optInt("likeCount", 0),
-                            retweets = p.optInt("repostCount", 0),
-                            replies = p.optInt("replyCount", 0),
-                            isVideo = embed?.optString("\$type")?.contains("video") == true
+                            id = item.optString("id", i.toString()),
+                            authorName = account.optString("display_name").ifBlank { account.optString("username", "User") },
+                            handle = "@${account.optString("acct", "user")}",
+                            avatarUrl = account.optString("avatar", ""),
+                            text = text,
+                            mediaUrl = mediaUrl,
+                            likes = item.optInt("favourites_count", 0),
+                            retweets = item.optInt("reblogs_count", 0),
+                            replies = item.optInt("replies_count", 0),
+                            isVideo = isVideo
                         )
                     )
                 }
