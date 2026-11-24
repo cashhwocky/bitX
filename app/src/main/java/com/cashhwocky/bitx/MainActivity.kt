@@ -1,4 +1,4 @@
-﻿package com.cashhwocky.bitx
+package com.cashhwocky.bitx
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -7,7 +7,10 @@ import android.os.Build
 import android.os.Bundle
 import android.webkit.CookieManager
 import android.webkit.WebView
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
 import android.webkit.WebViewClient
+import kotlinx.coroutines.delay
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
@@ -250,49 +253,88 @@ fun BitXRoot() {
 @Composable
 fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
     val colors = MaterialTheme.colorScheme
+
+    fun checkCookies(): Boolean {
+        val cm = CookieManager.getInstance()
+        cm.flush()
+        val cookies = cm.getCookie("https://x.com") ?: return false
+        val map = cookies.split(";").associate {
+            val parts = it.trim().split("=", limit = 2)
+            parts[0] to (parts.getOrNull(1) ?: "")
+        }
+        val token = map["auth_token"]
+        val csrf = map["ct0"]
+        if (!token.isNullOrBlank() && !csrf.isNullOrBlank()) {
+            onAuthenticated(token, csrf)
+            return true
+        }
+        return false
+    }
+
+    // Poll cookies every 1.5s so SPA login redirects are caught immediately
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1500)
+            if (checkCookies()) break
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(colors.surface)
             .windowInsetsPadding(WindowInsets.statusBars)
+            .windowInsetsPadding(WindowInsets.ime)
     ) {
         Surface(
             color = colors.primaryContainer,
-            shape = RoundedCornerShape(bottomStart = 28.dp, bottomEnd = 28.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                Text("Sign in to bitX", color = colors.onPrimaryContainer, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
-                Spacer(modifier = Modifier.height(4.dp))
-                Text("One-time login to grab your X session. Once signed in, the app switches to 100% native Material You.", color = colors.onPrimaryContainer.copy(alpha = 0.8f), fontSize = 13.sp)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Sign in to bitX", color = colors.onPrimaryContainer, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Switches to native Material You once signed in", color = colors.onPrimaryContainer.copy(alpha = 0.8f), fontSize = 12.sp)
+                }
+                FilledTonalButton(onClick = { checkCookies() }) {
+                    Text("Done")
+                }
             }
         }
 
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
             factory = { ctx ->
                 WebView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
                     CookieManager.getInstance().setAcceptCookie(true)
                     CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.userAgentString = "Mozilla/5.0 (Linux; Android 15; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        useWideViewPort = true
+                        loadWithOverviewMode = true
+                        javaScriptCanOpenWindowsAutomatically = true
+                        userAgentString = "Mozilla/5.0 (Linux; Android 15; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
+                    }
+                    webChromeClient = WebChromeClient()
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            val cookies = CookieManager.getInstance().getCookie("https://x.com") ?: return
-                            val map = cookies.split(";").associate {
-                                val parts = it.trim().split("=", limit = 2)
-                                parts[0] to (parts.getOrNull(1) ?: "")
-                            }
-                            val token = map["auth_token"]
-                            val csrf = map["ct0"]
-                            if (!token.isNullOrBlank() && !csrf.isNullOrBlank()) {
-                                onAuthenticated(token, csrf)
-                            }
+                            checkCookies()
                         }
                     }
-                    loadUrl("https://x.com/i/flow/login")
+                    loadUrl("https://x.com/login")
                 }
             }
         )
@@ -565,3 +607,4 @@ fun StatPill(icon: ImageVector, count: Int) {
         }
     }
 }
+
