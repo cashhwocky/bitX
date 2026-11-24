@@ -5,14 +5,14 @@ import android.content.Context
 import android.graphics.Color as AndroidColor
 import android.os.Build
 import android.os.Bundle
-import android.webkit.CookieManager
-import android.webkit.WebView
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebView
 import android.webkit.WebViewClient
-import kotlinx.coroutines.delay
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
@@ -22,9 +22,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -43,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -83,7 +88,10 @@ object XApiClient {
 
     private val queryIdCache = mutableMapOf<String, String>()
 
-    // Dynamically scrapes live GraphQL queryIds from x.com's active JS bundle
+    fun clearCache() {
+        queryIdCache.clear()
+    }
+
     private fun resolveQueryIds(authToken: String, ct0: String) {
         if (queryIdCache.containsKey("HomeTimeline")) return
         val homeReq = Request.Builder()
@@ -228,17 +236,15 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
         setContent {
-            BitXMaterialYouTheme {
-                BitXRoot()
-            }
+            BitXRoot()
         }
     }
 }
 
 @Composable
-fun BitXMaterialYouTheme(content: @Composable () -> Unit) {
+fun BitXMaterialYouTheme(amoledBlack: Boolean, content: @Composable () -> Unit) {
     val context = LocalContext.current
-    val colorScheme = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    val baseScheme = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         dynamicDarkColorScheme(context)
     } else {
         darkColorScheme(
@@ -250,7 +256,17 @@ fun BitXMaterialYouTheme(content: @Composable () -> Unit) {
             surface = Color(0xFF111318)
         )
     }
-    MaterialTheme(colorScheme = colorScheme, content = content)
+    val finalScheme = if (amoledBlack) {
+        baseScheme.copy(
+            background = Color.Black,
+            surface = Color.Black,
+            surfaceContainerLowest = Color.Black,
+            surfaceContainerLow = Color(0xFF0A0A0A),
+            surfaceContainer = Color(0xFF0F0F0F)
+        )
+    } else baseScheme
+
+    MaterialTheme(colorScheme = finalScheme, content = content)
 }
 
 @Composable
@@ -259,26 +275,35 @@ fun BitXRoot() {
     val prefs = remember { context.getSharedPreferences("bitx_auth", Context.MODE_PRIVATE) }
     var authToken by remember { mutableStateOf(prefs.getString("auth_token", null)) }
     var ct0 by remember { mutableStateOf(prefs.getString("ct0", null)) }
+    var amoledBlack by remember { mutableStateOf(prefs.getBoolean("amoled_black", false)) }
 
-    if (authToken.isNullOrBlank() || ct0.isNullOrBlank()) {
-        XNativeAuthScreen(
-            onAuthenticated = { token, csrf ->
-                prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
-                authToken = token
-                ct0 = csrf
-            }
-        )
-    } else {
-        NativeBitXApp(
-            authToken = authToken!!,
-            ct0 = ct0!!,
-            onLogout = {
-                prefs.edit().clear().apply()
-                CookieManager.getInstance().removeAllCookies(null)
-                authToken = null
-                ct0 = null
-            }
-        )
+    BitXMaterialYouTheme(amoledBlack = amoledBlack) {
+        if (authToken.isNullOrBlank() || ct0.isNullOrBlank()) {
+            XNativeAuthScreen(
+                onAuthenticated = { token, csrf ->
+                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                    authToken = token
+                    ct0 = csrf
+                }
+            )
+        } else {
+            NativeBitXApp(
+                authToken = authToken!!,
+                ct0 = ct0!!,
+                amoledBlack = amoledBlack,
+                onToggleAmoled = { enabled ->
+                    amoledBlack = enabled
+                    prefs.edit().putBoolean("amoled_black", enabled).apply()
+                },
+                onLogout = {
+                    prefs.edit().remove("auth_token").remove("ct0").apply()
+                    CookieManager.getInstance().removeAllCookies(null)
+                    XApiClient.clearCache()
+                    authToken = null
+                    ct0 = null
+                }
+            )
+        }
     }
 }
 
@@ -304,7 +329,6 @@ fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
         return false
     }
 
-    // Poll cookies every 1.5s so SPA login redirects are caught immediately
     LaunchedEffect(Unit) {
         while (true) {
             delay(1500)
@@ -375,10 +399,17 @@ fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
 }
 
 @Composable
-fun NativeBitXApp(authToken: String, ct0: String, onLogout: () -> Unit) {
+fun NativeBitXApp(
+    authToken: String,
+    ct0: String,
+    amoledBlack: Boolean,
+    onToggleAmoled: (Boolean) -> Unit,
+    onLogout: () -> Unit
+) {
     val colors = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
     var selectedTab by remember { mutableStateOf(BitXTab.HOME) }
+    var showSettings by remember { mutableStateOf(false) }
     var tweets by remember { mutableStateOf<List<NativeTweet>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -397,9 +428,24 @@ fun NativeBitXApp(authToken: String, ct0: String, onLogout: () -> Unit) {
 
     LaunchedEffect(selectedTab) { loadTab(selectedTab) }
 
+    if (showSettings) {
+        BackHandler { showSettings = false }
+        SettingsScreen(
+            amoledBlack = amoledBlack,
+            onToggleAmoled = onToggleAmoled,
+            onClearCache = {
+                XApiClient.clearCache()
+                showSettings = false
+                loadTab(selectedTab)
+            },
+            onLogout = onLogout,
+            onBack = { showSettings = false }
+        )
+        return
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(colors.surface)) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Heavy Material You Top Bar
             Surface(
                 color = colors.surfaceContainer,
                 tonalElevation = 4.dp,
@@ -431,14 +477,13 @@ fun NativeBitXApp(authToken: String, ct0: String, onLogout: () -> Unit) {
                         FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
                             Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
                         }
-                        FilledTonalIconButton(onClick = onLogout) {
-                            Icon(Icons.Filled.Logout, contentDescription = "Log out")
+                        FilledTonalIconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
                         }
                     }
                 }
             }
 
-            // Native Search Bar on Search Tab
             if (selectedTab == BitXTab.SEARCH) {
                 OutlinedTextField(
                     value = searchQuery,
@@ -457,7 +502,6 @@ fun NativeBitXApp(authToken: String, ct0: String, onLogout: () -> Unit) {
                 )
             }
 
-            // Main Native Content Area
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when {
                     isLoading -> {
@@ -575,6 +619,187 @@ fun NativeBitXApp(authToken: String, ct0: String, onLogout: () -> Unit) {
 }
 
 @Composable
+fun SettingsScreen(
+    amoledBlack: Boolean,
+    onToggleAmoled: (Boolean) -> Unit,
+    onClearCache: () -> Unit,
+    onLogout: () -> Unit,
+    onBack: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val currentVersion = remember {
+        try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.0.0"
+        } catch (_: Exception) { "2.0.0" }
+    }
+    var updateStatus by remember { mutableStateOf("Tap to check GitHub Releases") }
+    var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+    var checkingUpdate by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.surface)
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .windowInsetsPadding(WindowInsets.navigationBars)
+    ) {
+        // Material You Settings Top Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            FilledTonalIconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Text("Settings", color = colors.onSurface, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // Appearance Section
+            Text("Appearance", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
+            ElevatedCard(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onToggleAmoled(!amoledBlack) }
+                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Pure AMOLED Black", color = colors.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                        Text("True #000000 canvas with dynamic Material You accents", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                    }
+                    Switch(checked = amoledBlack, onCheckedChange = onToggleAmoled)
+                }
+            }
+
+            // Updates & Network Section
+            Text("Updates & Engine", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
+            ElevatedCard(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow)
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = !checkingUpdate) {
+                                scope.launch {
+                                    checkingUpdate = true
+                                    updateStatus = "Checking github.com/cashhwocky/bitX..."
+                                    val info = UpdateManager.checkForUpdate(currentVersion)
+                                    if (info != null) {
+                                        availableUpdate = info
+                                        updateStatus = "Update v${info.versionTag} available!"
+                                    } else {
+                                        updateStatus = "You're on the latest build (v$currentVersion)"
+                                    }
+                                    checkingUpdate = false
+                                }
+                            }
+                            .padding(horizontal = 18.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Check for Updates", color = colors.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Text(updateStatus, color = colors.onSurfaceVariant, fontSize = 13.sp)
+                        }
+                        if (checkingUpdate) {
+                            CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.5.dp)
+                        } else {
+                            Icon(Icons.Filled.SystemUpdate, contentDescription = null, tint = colors.primary)
+                        }
+                    }
+
+                    if (availableUpdate != null) {
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    updateStatus = "Downloading APK..."
+                                    UpdateManager.downloadAndInstall(context, availableUpdate!!.apkUrl)
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 18.dp, vertical = 8.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Text("Download & Install v${availableUpdate!!.versionTag}")
+                        }
+                    }
+
+                    HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.4f), modifier = Modifier.padding(horizontal = 18.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onClearCache() }
+                            .padding(horizontal = 18.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Refresh GraphQL Endpoints", color = colors.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Text("Clears cached X query IDs and re-fetches live hashes", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                        }
+                        Icon(Icons.Filled.Cached, contentDescription = null, tint = colors.secondary)
+                    }
+                }
+            }
+
+            // Account Section
+            Text("Account", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
+            ElevatedCard(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.elevatedCardColors(containerColor = colors.errorContainer)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onLogout() }
+                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("Sign Out", color = colors.onErrorContainer, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        Text("Clears local session cookies", color = colors.onErrorContainer.copy(alpha = 0.8f), fontSize = 13.sp)
+                    }
+                    Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = colors.onErrorContainer)
+                }
+            }
+
+            // About Card
+            ElevatedCard(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.elevatedCardColors(containerColor = colors.primaryContainer)
+            ) {
+                Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
+                    Text("bitX", color = colors.onPrimaryContainer, fontWeight = FontWeight.Black, fontSize = 20.sp)
+                    Text("Version $currentVersion ? Built by cashhwocky", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun MaterialYouTweetCard(tweet: NativeTweet) {
     val colors = MaterialTheme.colorScheme
     ElevatedCard(
@@ -640,5 +865,3 @@ fun StatPill(icon: ImageVector, count: Int) {
         }
     }
 }
-
-
