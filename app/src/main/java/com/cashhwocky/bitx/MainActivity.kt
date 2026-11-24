@@ -76,10 +76,41 @@ enum class BitXTab(
 
 object XApiClient {
     private val client = OkHttpClient()
-    // Public X web bearer token used by x.com
     private const val BEARER = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+    private const val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
 
     private const val FEATURES = """{"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_enhance_cards_enabled":false}"""
+
+    private val queryIdCache = mutableMapOf<String, String>()
+
+    // Dynamically scrapes live GraphQL queryIds from x.com's active JS bundle
+    private fun resolveQueryIds(authToken: String, ct0: String) {
+        if (queryIdCache.containsKey("HomeTimeline")) return
+        val homeReq = Request.Builder()
+            .url("https://x.com/home")
+            .header("cookie", "auth_token=$authToken; ct0=$ct0")
+            .header("user-agent", UA)
+            .build()
+
+        val html = client.newCall(homeReq).execute().use { it.body?.string().orEmpty() }
+        val jsUrls = Regex("""https://abs\.twimg\.com/responsive-web/client-web[^"']+/main\.[^"']+\.js""")
+            .findAll(html).map { it.value }.distinct().toList()
+
+        val ops = listOf("HomeTimeline", "HomeLatestTimeline", "Bookmarks", "SearchTimeline")
+        for (jsUrl in jsUrls) {
+            val jsBody = client.newCall(Request.Builder().url(jsUrl).header("user-agent", UA).build())
+                .execute().use { it.body?.string().orEmpty() }
+            for (op in ops) {
+                if (!queryIdCache.containsKey(op)) {
+                    val match = Regex("""queryId:"([a-zA-Z0-9_-]+)",operationName:"$op"""").find(jsBody)
+                    if (match != null) {
+                        queryIdCache[op] = match.groupValues[1]
+                    }
+                }
+            }
+            if (queryIdCache.size >= 3) break
+        }
+    }
 
     suspend fun fetchFeed(
         authToken: String,
@@ -88,24 +119,26 @@ object XApiClient {
         query: String = ""
     ): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
-            val url = when (tab) {
+            resolveQueryIds(authToken, ct0)
+
+            val (opName, varsJson) = when (tab) {
                 BitXTab.HOME, BitXTab.CLIPS -> {
-                    val vars = URLEncoder.encode("""{"count":30,"includePromotedContent":false,"latestControlAvailable":true}""", "UTF-8")
-                    val feat = URLEncoder.encode(FEATURES, "UTF-8")
-                    "https://x.com/i/api/graphql/W4Tvz1PbNkbyboX4wJqEfA/HomeTimeline?variables=$vars&features=$feat"
+                    val op = if (queryIdCache.containsKey("HomeTimeline")) "HomeTimeline" else "HomeLatestTimeline"
+                    op to """{"count":30,"includePromotedContent":false,"latestControlAvailable":true}"""
                 }
-                BitXTab.SAVED -> {
-                    val vars = URLEncoder.encode("""{"count":30,"includePromotedContent":false}""", "UTF-8")
-                    val feat = URLEncoder.encode(FEATURES, "UTF-8")
-                    "https://x.com/i/api/graphql/xLjCVOEWOFflkcrGOWPczw/Bookmarks?variables=$vars&features=$feat"
-                }
+                BitXTab.SAVED -> "Bookmarks" to """{"count":30,"includePromotedContent":false}"""
                 BitXTab.SEARCH -> {
-                    val q = query.ifBlank { "Android OR Pixel" }
-                    val vars = URLEncoder.encode("""{"rawQuery":"$q","count":25,"querySource":"typed_query","product":"Top"}""", "UTF-8")
-                    val feat = URLEncoder.encode(FEATURES, "UTF-8")
-                    "https://x.com/i/api/graphql/gkjsKepM6gl_HmFWoWKfgg/SearchTimeline?variables=$vars&features=$feat"
+                    val q = query.ifBlank { "Android OR Pixel" }.replace("\"", "")
+                    "SearchTimeline" to """{"rawQuery":"$q","count":25,"querySource":"typed_query","product":"Top"}"""
                 }
             }
+
+            val qId = queryIdCache[opName]
+                ?: return@withContext Result.failure(Exception("Could not resolve live $opName endpoint from x.com"))
+
+            val vars = URLEncoder.encode(varsJson, "UTF-8")
+            val feat = URLEncoder.encode(FEATURES, "UTF-8")
+            val url = "https://x.com/i/api/graphql/$qId/$opName?variables=$vars&features=$feat"
 
             val req = Request.Builder()
                 .url(url)
@@ -114,13 +147,14 @@ object XApiClient {
                 .header("x-twitter-auth-type", "OAuth2Session")
                 .header("x-twitter-active-user", "yes")
                 .header("cookie", "auth_token=$authToken; ct0=$ct0")
-                .header("user-agent", "Mozilla/5.0 (Linux; Android 15; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36")
+                .header("user-agent", UA)
                 .build()
 
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    return@withContext Result.failure(Exception("HTTP ${resp.code}: X rotated endpoint or session expired"))
+                    queryIdCache.clear()
+                    return@withContext Result.failure(Exception("HTTP ${resp.code}: ${body.take(120)}"))
                 }
                 val parsed = parseTweetsDeep(body)
                 val finalTweets = if (tab == BitXTab.CLIPS) {
@@ -135,7 +169,6 @@ object XApiClient {
         }
     }
 
-    // Recursively extracts tweet_results objects from any X GraphQL response structure
     private fun parseTweetsDeep(jsonStr: String): List<NativeTweet> {
         val results = mutableListOf<NativeTweet>()
         val seenIds = mutableSetOf<String>()
@@ -607,4 +640,5 @@ fun StatPill(icon: ImageVector, count: Int) {
         }
     }
 }
+
 
