@@ -40,6 +40,7 @@ object PublicGuestClient {
         val mediaList = mutableListOf<String>()
         var isVideo = false
         var videoUrl: String? = null
+        var embedVideoUrl: String? = null
 
         val mediaArr = item.optJSONArray("media_attachments")
         if (mediaArr != null) {
@@ -64,9 +65,20 @@ object PublicGuestClient {
             }
         }
 
-        if (mediaList.isEmpty() && videoUrl == null) {
-            val cardImg = item.optJSONObject("card")?.optString("image")?.takeIf { it.isNotBlank() && it != "null" }
-            if (cardImg != null) mediaList.add(cardImg)
+        // Check Mastodon link preview card (YouTube, PeerTube, Vimeo, etc.)
+        val card = item.optJSONObject("card")
+        if (card != null && videoUrl == null) {
+            val cardType = card.optString("type").lowercase()
+            val cardUrl = card.optString("url").takeIf { it.isNotBlank() && it != "null" }
+            val cardImg = card.optString("image").takeIf { it.isNotBlank() && it != "null" }
+            if (cardImg != null && mediaList.isEmpty()) mediaList.add(cardImg)
+
+            val isVideoCard = cardType == "video" ||
+                (cardUrl != null && (cardUrl.contains("youtube.com") || cardUrl.contains("youtu.be") || cardUrl.contains("vimeo.com") || cardUrl.contains("/videos/watch/")))
+            if (isVideoCard && cardUrl != null) {
+                isVideo = true
+                embedVideoUrl = cardUrl
+            }
         }
 
         val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty() || videoUrl != null)
@@ -81,6 +93,7 @@ object PublicGuestClient {
             mediaUrl = mediaList.firstOrNull(),
             mediaUrls = mediaList,
             videoUrl = videoUrl,
+            embedVideoUrl = embedVideoUrl,
             likes = item.optInt("favourites_count", 0),
             retweets = item.optInt("reblogs_count", 0),
             replies = item.optInt("replies_count", 0),
@@ -99,7 +112,7 @@ object PublicGuestClient {
                     val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
                     if (cleanTag.isBlank()) return@withContext Result.success(emptyList())
                     val encoded = URLEncoder.encode(cleanTag, "UTF-8")
-                    "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=30"
+                    "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=40"
                 }
             }
 

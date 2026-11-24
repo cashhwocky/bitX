@@ -79,6 +79,7 @@ data class NativeTweet(
     val mediaUrl: String?,
     val mediaUrls: List<String> = listOfNotNull(mediaUrl),
     val videoUrl: String? = null,
+    val embedVideoUrl: String? = null,
     val likes: Int,
     val retweets: Int,
     val replies: Int,
@@ -611,6 +612,7 @@ fun NativeBitXApp(
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var searchQuery by remember { mutableStateOf("") }
     var hasSearched by remember { mutableStateOf(false) }
+    var videosOnly by remember { mutableStateOf(false) }
 
     fun toggleSavePost(tweet: NativeTweet) {
         val exists = savedPosts.any { it.id == tweet.id }
@@ -661,121 +663,32 @@ fun NativeBitXApp(
 
     LaunchedEffect(selectedTab, isLoggedIn) {
         if (selectedTab == BitXTab.SEARCH) {
-            if (!hasSearched) {
-                tweets = emptyList()
-                errorMsg = null
-                isLoading = false
-            }
-        } else if (selectedTab != BitXTab.SAVED) {
-            loadTab(selectedTab)
-        }
-    }
-
-    if (activeCommentsTweet != null) {
-        BackHandler { activeCommentsTweet = null }
-        CommentsScreen(
-            parentTweet = activeCommentsTweet!!,
-            allowNsfw = allowNsfw,
-            savedIds = savedPosts.map { it.id }.toSet(),
-            onToggleSave = ::toggleSavePost,
-            onBack = { activeCommentsTweet = null }
-        )
-        return
-    }
-
-    if (showSettings) {
-        BackHandler { showSettings = false }
-        SettingsScreen(
-            isLoggedIn = isLoggedIn,
-            amoledBlack = amoledBlack,
-            allowNsfw = allowNsfw,
-            onToggleAmoled = onToggleAmoled,
-            onToggleNsfw = onToggleNsfw,
-            onClearCache = {
-                XApiClient.clearCache()
-                showSettings = false
-                loadTab(selectedTab)
-            },
-            onOpenLogin = {
-                showSettings = false
-                onOpenLogin()
-            },
-            onSaveManualCookies = { token, csrf ->
-                onSaveManualCookies(token, csrf)
-                showSettings = false
-            },
-            onLogout = onLogout,
-            onBack = { showSettings = false }
-        )
-        return
-    }
-
-    val savedIdSet = remember(savedPosts) { savedPosts.map { it.id }.toSet() }
-
-    Box(modifier = Modifier.fillMaxSize().background(colors.surface)) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Surface(
-                color = colors.surfaceContainer,
-                tonalElevation = 4.dp,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .windowInsetsPadding(WindowInsets.statusBars)
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Surface(color = colors.primaryContainer, shape = RoundedCornerShape(16.dp)) {
-                            Text(
-                                "bitX",
-                                color = colors.onPrimaryContainer,
-                                fontWeight = FontWeight.Black,
-                                fontSize = 18.sp,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(selectedTab.label, color = colors.onSurface, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-                    }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (isLoggedIn) {
-                            FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
-                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("Search tags or topics...") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(28.dp),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { executeSearch() }),
+                        trailingIcon = {
+                            IconButton(onClick = { executeSearch() }) {
+                                Icon(Icons.Filled.Search, contentDescription = "Search")
                             }
-                        } else {
-                            FilledTonalButton(onClick = onOpenLogin) {
-                                Text("Sign In", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                        FilledTonalIconButton(onClick = { showSettings = true }) {
-                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
-                        }
-                    }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    FilterChip(
+                        selected = videosOnly,
+                        onClick = { videosOnly = !videosOnly },
+                        label = { Text("Videos Only") },
+                        leadingIcon = if (videosOnly) {
+                            { Icon(Icons.Filled.PlayCircle, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        } else null
+                    )
                 }
-            }
-
-            if (selectedTab == BitXTab.SEARCH) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Search tags or topics...") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(28.dp),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = { executeSearch() }),
-                    trailingIcon = {
-                        IconButton(onClick = { executeSearch() }) {
-                            Icon(Icons.Filled.Search, contentDescription = "Search")
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
-                )
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -844,7 +757,7 @@ fun NativeBitXApp(
                                 verticalArrangement = Arrangement.spacedBy(10.dp),
                                 modifier = Modifier.fillMaxSize()
                             ) {
-                                items(tweets, key = { it.id }) { tweet ->
+                                val displayed = if (selectedTab == BitXTab.SEARCH && videosOnly) tweets.filter { it.isVideo || !it.videoUrl.isNullOrBlank() || !it.embedVideoUrl.isNullOrBlank() } else tweets; items(displayed, key = { it.id }) { tweet ->
                                     MaterialYouTweetCard(
                                         tweet = tweet,
                                         allowNsfw = allowNsfw,
@@ -1372,6 +1285,60 @@ fun MaterialYouTweetCard(
                             .height(260.dp)
                             .clip(RoundedCornerShape(18.dp))
                     )
+                } else if (!tweet.embedVideoUrl.isNullOrBlank()) {
+                    var playingEmbed by remember(tweet.id) { mutableStateOf(false) }
+                    if (playingEmbed) {
+                        AndroidView(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(260.dp)
+                                .clip(RoundedCornerShape(18.dp)),
+                            factory = { ctx ->
+                                WebView(ctx).apply {
+                                    settings.javaScriptEnabled = true
+                                    settings.domStorageEnabled = true
+                                    settings.mediaPlaybackRequiresUserGesture = false
+                                    webChromeClient = WebChromeClient()
+                                    webViewClient = WebViewClient()
+                                    loadUrl(tweet.embedVideoUrl)
+                                }
+                            }
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(240.dp)
+                                .clip(RoundedCornerShape(18.dp))
+                                .clickable { playingEmbed = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (tweet.mediaUrls.isNotEmpty()) {
+                                AsyncImage(
+                                    model = tweet.mediaUrls.first(),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                Box(modifier = Modifier.fillMaxSize().background(colors.surfaceContainerHighest))
+                            }
+                            Surface(
+                                color = colors.primaryContainer.copy(alpha = 0.92f),
+                                shape = CircleShape,
+                                shadowElevation = 6.dp
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Filled.PlayArrow, contentDescription = "Play", tint = colors.onPrimaryContainer)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Play Video", color = colors.onPrimaryContainer, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
                 } else if (tweet.mediaUrls.size == 1) {
                     AsyncImage(
                         model = tweet.mediaUrls.first(),
@@ -1447,4 +1414,5 @@ fun StatPill(
         }
     }
 }
+
 
