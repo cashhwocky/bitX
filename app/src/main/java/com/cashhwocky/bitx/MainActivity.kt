@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -276,24 +277,35 @@ fun BitXRoot() {
     var authToken by remember { mutableStateOf(prefs.getString("auth_token", null)) }
     var ct0 by remember { mutableStateOf(prefs.getString("ct0", null)) }
     var amoledBlack by remember { mutableStateOf(prefs.getBoolean("amoled_black", false)) }
+    var showLoginScreen by remember { mutableStateOf(false) }
 
     BitXMaterialYouTheme(amoledBlack = amoledBlack) {
-        if (authToken.isNullOrBlank() || ct0.isNullOrBlank()) {
+        if (showLoginScreen) {
+            BackHandler { showLoginScreen = false }
             XNativeAuthScreen(
                 onAuthenticated = { token, csrf ->
                     prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
                     authToken = token
                     ct0 = csrf
-                }
+                    showLoginScreen = false
+                },
+                onSkip = { showLoginScreen = false }
             )
         } else {
             NativeBitXApp(
-                authToken = authToken!!,
-                ct0 = ct0!!,
+                authToken = authToken,
+                ct0 = ct0,
                 amoledBlack = amoledBlack,
                 onToggleAmoled = { enabled ->
                     amoledBlack = enabled
                     prefs.edit().putBoolean("amoled_black", enabled).apply()
+                },
+                onOpenLogin = { showLoginScreen = true },
+                onSaveManualCookies = { token, csrf ->
+                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                    authToken = token
+                    ct0 = csrf
+                    XApiClient.clearCache()
                 },
                 onLogout = {
                     prefs.edit().remove("auth_token").remove("ct0").apply()
@@ -309,7 +321,10 @@ fun BitXRoot() {
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
+fun XNativeAuthScreen(
+    onAuthenticated: (String, String) -> Unit,
+    onSkip: () -> Unit
+) {
     val colors = MaterialTheme.colorScheme
 
     fun checkCookies(): Boolean {
@@ -350,13 +365,18 @@ fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Sign in to bitX", color = colors.onPrimaryContainer, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
-                    Text("Switches to native Material You once signed in", color = colors.onPrimaryContainer.copy(alpha = 0.8f), fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    IconButton(onClick = onSkip) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = colors.onPrimaryContainer)
+                    }
+                    Column {
+                        Text("Sign in to X", color = colors.onPrimaryContainer, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("Optional - returns to native feed automatically", color = colors.onPrimaryContainer.copy(alpha = 0.8f), fontSize = 12.sp)
+                    }
                 }
                 FilledTonalButton(onClick = { checkCookies() }) {
                     Text("Done")
@@ -400,43 +420,61 @@ fun XNativeAuthScreen(onAuthenticated: (String, String) -> Unit) {
 
 @Composable
 fun NativeBitXApp(
-    authToken: String,
-    ct0: String,
+    authToken: String?,
+    ct0: String?,
     amoledBlack: Boolean,
     onToggleAmoled: (Boolean) -> Unit,
+    onOpenLogin: () -> Unit,
+    onSaveManualCookies: (String, String) -> Unit,
     onLogout: () -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
+    val isLoggedIn = !authToken.isNullOrBlank() && !ct0.isNullOrBlank()
     var selectedTab by remember { mutableStateOf(BitXTab.HOME) }
     var showSettings by remember { mutableStateOf(false) }
     var tweets by remember { mutableStateOf<List<NativeTweet>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(true) }
+    var isLoading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var searchQuery by remember { mutableStateOf("") }
 
     fun loadTab(tab: BitXTab, q: String = searchQuery) {
+        if (!isLoggedIn) {
+            isLoading = false
+            errorMsg = null
+            tweets = emptyList()
+            return
+        }
         scope.launch {
             isLoading = true
             errorMsg = null
-            XApiClient.fetchFeed(authToken, ct0, tab, q)
+            XApiClient.fetchFeed(authToken!!, ct0!!, tab, q)
                 .onSuccess { tweets = it }
                 .onFailure { errorMsg = it.message }
             isLoading = false
         }
     }
 
-    LaunchedEffect(selectedTab) { loadTab(selectedTab) }
+    LaunchedEffect(selectedTab, isLoggedIn) { loadTab(selectedTab) }
 
     if (showSettings) {
         BackHandler { showSettings = false }
         SettingsScreen(
+            isLoggedIn = isLoggedIn,
             amoledBlack = amoledBlack,
             onToggleAmoled = onToggleAmoled,
             onClearCache = {
                 XApiClient.clearCache()
                 showSettings = false
                 loadTab(selectedTab)
+            },
+            onOpenLogin = {
+                showSettings = false
+                onOpenLogin()
+            },
+            onSaveManualCookies = { token, csrf ->
+                onSaveManualCookies(token, csrf)
+                showSettings = false
             },
             onLogout = onLogout,
             onBack = { showSettings = false }
@@ -474,8 +512,14 @@ fun NativeBitXApp(
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
-                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                        if (isLoggedIn) {
+                            FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
+                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                            }
+                        } else {
+                            FilledTonalButton(onClick = onOpenLogin) {
+                                Text("Sign In", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                         FilledTonalIconButton(onClick = { showSettings = true }) {
                             Icon(Icons.Filled.Settings, contentDescription = "Settings")
@@ -504,6 +548,13 @@ fun NativeBitXApp(
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    !isLoggedIn -> {
+                        GuestModePlaceholder(
+                            tab = selectedTab,
+                            onSignIn = onOpenLogin,
+                            onOpenSettings = { showSettings = true }
+                        )
+                    }
                     isLoading -> {
                         CircularProgressIndicator(
                             modifier = Modifier.align(Alignment.Center),
@@ -619,10 +670,88 @@ fun NativeBitXApp(
 }
 
 @Composable
+fun GuestModePlaceholder(
+    tab: BitXTab,
+    onSignIn: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        ElevatedCard(
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow),
+            modifier = Modifier.fillMaxWidth().padding(bottom = 72.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Surface(
+                    color = colors.primaryContainer,
+                    shape = CircleShape,
+                    modifier = Modifier.size(60.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = tab.selectedIcon,
+                            contentDescription = null,
+                            tint = colors.onPrimaryContainer,
+                            modifier = Modifier.size(30.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Guest Mode ? ${tab.label}",
+                    color = colors.onSurface,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "X requires an account session to load live feeds. Sign in whenever you're ready, or paste your browser cookies in Settings to skip the login rate limit.",
+                    color = colors.onSurfaceVariant,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+                Button(
+                    onClick = onSignIn,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Sign in to X")
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                FilledTonalButton(
+                    onClick = onOpenSettings,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Paste Cookies in Settings")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun SettingsScreen(
+    isLoggedIn: Boolean,
     amoledBlack: Boolean,
     onToggleAmoled: (Boolean) -> Unit,
     onClearCache: () -> Unit,
+    onOpenLogin: () -> Unit,
+    onSaveManualCookies: (String, String) -> Unit,
     onLogout: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -637,6 +766,55 @@ fun SettingsScreen(
     var updateStatus by remember { mutableStateOf("Tap to check GitHub Releases") }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     var checkingUpdate by remember { mutableStateOf(false) }
+    var showCookieDialog by remember { mutableStateOf(false) }
+    var manualAuthToken by remember { mutableStateOf("") }
+    var manualCt0 by remember { mutableStateOf("") }
+
+    if (showCookieDialog) {
+        AlertDialog(
+            onDismissRequest = { showCookieDialog = false },
+            title = { Text("Paste X Session Cookies", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Copy auth_token and ct0 from x.com in Chrome DevTools (Application -> Cookies) to bypass login rate limits.",
+                        fontSize = 13.sp,
+                        color = colors.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = manualAuthToken,
+                        onValueChange = { manualAuthToken = it.trim() },
+                        label = { Text("auth_token") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    OutlinedTextField(
+                        value = manualCt0,
+                        onValueChange = { manualCt0 = it.trim() },
+                        label = { Text("ct0") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = manualAuthToken.isNotBlank() && manualCt0.isNotBlank(),
+                    onClick = {
+                        showCookieDialog = false
+                        onSaveManualCookies(manualAuthToken, manualCt0)
+                    }
+                ) {
+                    Text("Save & Connect")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCookieDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -645,7 +823,6 @@ fun SettingsScreen(
             .windowInsetsPadding(WindowInsets.statusBars)
             .windowInsetsPadding(WindowInsets.navigationBars)
     ) {
-        // Material You Settings Top Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -666,7 +843,6 @@ fun SettingsScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // Appearance Section
             Text("Appearance", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
             ElevatedCard(
                 shape = RoundedCornerShape(24.dp),
@@ -688,7 +864,6 @@ fun SettingsScreen(
                 }
             }
 
-            // Updates & Network Section
             Text("Updates & Engine", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
             ElevatedCard(
                 shape = RoundedCornerShape(24.dp),
@@ -763,36 +938,70 @@ fun SettingsScreen(
                 }
             }
 
-            // Account Section
             Text("Account", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.padding(start = 8.dp))
             ElevatedCard(
                 shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.elevatedCardColors(containerColor = colors.errorContainer)
+                colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow)
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onLogout() }
-                        .padding(horizontal = 18.dp, vertical = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column {
-                        Text("Sign Out", color = colors.onErrorContainer, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        Text("Clears local session cookies", color = colors.onErrorContainer.copy(alpha = 0.8f), fontSize = 13.sp)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showCookieDialog = true }
+                            .padding(horizontal = 18.dp, vertical = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Paste Session Cookies", color = colors.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                            Text("Import auth_token & ct0 to bypass login rate limits", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                        }
+                        Icon(Icons.Filled.Key, contentDescription = null, tint = colors.primary)
                     }
-                    Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = colors.onErrorContainer)
+
+                    HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.4f), modifier = Modifier.padding(horizontal = 18.dp))
+
+                    if (isLoggedIn) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onLogout() }
+                                .padding(horizontal = 18.dp, vertical = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text("Sign Out", color = colors.error, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text("Clears local session cookies", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                            }
+                            Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = colors.error)
+                        }
+                    } else {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onOpenLogin() }
+                                .padding(horizontal = 18.dp, vertical = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column {
+                                Text("Sign In to X", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text("Optional - log in via X web flow", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                            }
+                            Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, tint = colors.primary)
+                        }
+                    }
                 }
             }
 
-            // About Card
             ElevatedCard(
                 shape = RoundedCornerShape(24.dp),
                 colors = CardDefaults.elevatedCardColors(containerColor = colors.primaryContainer)
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
                     Text("bitX", color = colors.onPrimaryContainer, fontWeight = FontWeight.Black, fontSize = 20.sp)
-                    Text("Version $currentVersion ? Built by cashhwocky", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
+                    Text("Version $currentVersion ? Built by Alex Desrosier (@cashhwocky)", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
                 }
             }
         }
