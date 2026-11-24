@@ -29,14 +29,49 @@ object PublicGuestClient {
         return text
     }
 
-    private fun isVideoUrl(url: String?): Boolean {
+    private fun isDirectVideoUrl(url: String?): Boolean {
         if (url.isNullOrBlank()) return false
         val lower = url.lowercase().substringBefore("?")
         return lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mov") || lower.endsWith(".m3u8")
     }
 
+    private fun toPlayableEmbedUrl(rawUrl: String): String {
+        // Convert YouTube watch/shorts/youtu.be URLs into clean embeddable player URLs
+        val ytId = Regex("""(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([a-zA-Z0-9_-]{11})""")
+            .find(rawUrl)?.groupValues?.getOrNull(1)
+        if (ytId != null) {
+            return "https://www.youtube.com/embed/$ytId?autoplay=1&playsinline=1"
+        }
+        // Convert PeerTube /w/ID or /videos/watch/ID to /videos/embed/ID
+        if (rawUrl.contains("/videos/watch/")) {
+            return rawUrl.replace("/videos/watch/", "/videos/embed/")
+        }
+        val ptMatch = Regex("""^(https?://[^/]+)/w/([a-zA-Z0-9_-]+)""").find(rawUrl)
+        if (ptMatch != null) {
+            return "${ptMatch.groupValues[1]}/videos/embed/${ptMatch.groupValues[2]}"
+        }
+        return rawUrl
+    }
+
+    private fun looksLikeVideoLink(url: String): Boolean {
+        val l = url.lowercase()
+        return l.contains("youtube.com") ||
+            l.contains("youtu.be") ||
+            l.contains("vimeo.com") ||
+            l.contains("peertube") ||
+            l.contains("/videos/watch/") ||
+            l.contains("/videos/embed/") ||
+            l.contains("/w/") ||
+            l.contains("streamable.com") ||
+            l.contains("redgifs.com") ||
+            l.contains("tiktok.com") ||
+            l.contains("twitch.tv") ||
+            l.contains("dailymotion.com")
+    }
+
     private fun parseStatus(item: JSONObject, fallbackId: String): NativeTweet? {
         val account = item.optJSONObject("account") ?: return null
+        val rawHtml = item.optString("content", "")
         val mediaList = mutableListOf<String>()
         var isVideo = false
         var videoUrl: String? = null
@@ -52,10 +87,12 @@ object PublicGuestClient {
                 val previewUrl = m.optString("preview_url").takeIf { it.isNotBlank() && it != "null" }
                 val resolvedUrl = directUrl ?: remoteUrl
 
-                if (type in listOf("video", "gifv") || isVideoUrl(resolvedUrl)) {
+                if (type in listOf("video", "gifv") || isDirectVideoUrl(resolvedUrl) || isDirectVideoUrl(remoteUrl)) {
                     isVideo = true
-                    if (videoUrl == null && resolvedUrl != null) {
-                        videoUrl = resolvedUrl
+                    if (videoUrl == null) {
+                        videoUrl = if (isDirectVideoUrl(resolvedUrl)) resolvedUrl
+                        else if (isDirectVideoUrl(remoteUrl)) remoteUrl
+                        else resolvedUrl
                     }
                     if (previewUrl != null) mediaList.add(previewUrl)
                 } else {
@@ -65,24 +102,44 @@ object PublicGuestClient {
             }
         }
 
-        // Check Mastodon link preview card (YouTube, PeerTube, Vimeo, etc.)
+        // Check Mastodon link preview card (iframe html or video URL)
         val card = item.optJSONObject("card")
         if (card != null && videoUrl == null) {
             val cardType = card.optString("type").lowercase()
             val cardUrl = card.optString("url").takeIf { it.isNotBlank() && it != "null" }
+            val cardHtml = card.optString("html", "")
             val cardImg = card.optString("image").takeIf { it.isNotBlank() && it != "null" }
             if (cardImg != null && mediaList.isEmpty()) mediaList.add(cardImg)
 
-            val isVideoCard = cardType == "video" ||
-                (cardUrl != null && (cardUrl.contains("youtube.com") || cardUrl.contains("youtu.be") || cardUrl.contains("vimeo.com") || cardUrl.contains("/videos/watch/")))
-            if (isVideoCard && cardUrl != null) {
+            val iframeSrc = Regex("""src=["'](https?://[^"']+)["']""").find(cardHtml)?.groupValues?.getOrNull(1)
+            if (iframeSrc != null) {
                 isVideo = true
-                embedVideoUrl = cardUrl
+                embedVideoUrl = iframeSrc
+            } else if (cardUrl != null && (cardType == "video" || looksLikeVideoLink(cardUrl))) {
+                isVideo = true
+                embedVideoUrl = toPlayableEmbedUrl(cardUrl)
             }
         }
 
-        val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty() || videoUrl != null)
-        if (text.isBlank() && mediaList.isEmpty() && videoUrl == null) return null
+        // Also scan links inside post HTML in case card was omitted
+        if (videoUrl == null && embedVideoUrl == null) {
+            val hrefs = Regex("""href=["'](https?://[^"']+)["']""").findAll(rawHtml).map { it.groupValues[1] }
+            for (href in hrefs) {
+                if (isDirectVideoUrl(href)) {
+                    isVideo = true
+                    videoUrl = href
+                    break
+                } else if (looksLikeVideoLink(href)) {
+                    isVideo = true
+                    embedVideoUrl = toPlayableEmbedUrl(href)
+                    break
+                }
+            }
+        }
+
+        val hasAnyMedia = mediaList.isNotEmpty() || videoUrl != null || embedVideoUrl != null
+        val text = stripHtml(rawHtml, stripTrailingUrls = hasAnyMedia)
+        if (text.isBlank() && !hasAnyMedia) return null
 
         return NativeTweet(
             id = item.optString("id", fallbackId),

@@ -15,14 +15,13 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.pager.VerticalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -47,13 +46,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -124,6 +123,7 @@ object SavedPostsStore {
                         mediaUrl = o.optString("mediaUrl").takeIf { it.isNotBlank() },
                         mediaUrls = urls,
                         videoUrl = o.optString("videoUrl").takeIf { it.isNotBlank() },
+                        embedVideoUrl = o.optString("embedVideoUrl").takeIf { it.isNotBlank() },
                         likes = o.optInt("likes", 0),
                         retweets = o.optInt("retweets", 0),
                         replies = o.optInt("replies", 0),
@@ -151,6 +151,7 @@ object SavedPostsStore {
                 put("mediaUrl", t.mediaUrl ?: "")
                 put("mediaUrls", JSONArray(t.mediaUrls))
                 put("videoUrl", t.videoUrl ?: "")
+                put("embedVideoUrl", t.embedVideoUrl ?: "")
                 put("likes", t.likes)
                 put("retweets", t.retweets)
                 put("replies", t.replies)
@@ -252,9 +253,7 @@ object XApiClient {
                     queryIdCache.clear()
                     return@withContext Result.failure(Exception("HTTP ${resp.code}: ${body.take(120)}"))
                 }
-                val parsed = parseTweetsDeep(body)
-                val finalTweets = parsed
-                Result.success(finalTweets)
+                Result.success(parseTweetsDeep(body))
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -393,47 +392,211 @@ fun BitXRoot() {
     var allowNsfw by remember { mutableStateOf(prefs.getBoolean("allow_nsfw", false)) }
     var showLoginScreen by remember { mutableStateOf(false) }
 
+    val currentVersion = remember {
+        try {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.0.0"
+        } catch (_: Exception) { "2.0.0" }
+    }
+    var startupUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    // Check GitHub Releases automatically every time the app opens
+    LaunchedEffect(Unit) {
+        startupUpdate = UpdateManager.checkForUpdate(currentVersion)
+    }
+
     BitXMaterialYouTheme(amoledBlack = amoledBlack) {
-        if (showLoginScreen) {
-            BackHandler { showLoginScreen = false }
-            XNativeAuthScreen(
-                onAuthenticated = { token, csrf ->
-                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
-                    authToken = token
-                    ct0 = csrf
-                    showLoginScreen = false
-                },
-                onSkip = { showLoginScreen = false }
-            )
-        } else {
-            NativeBitXApp(
-                authToken = authToken,
-                ct0 = ct0,
-                amoledBlack = amoledBlack,
-                allowNsfw = allowNsfw,
-                onToggleAmoled = { enabled ->
-                    amoledBlack = enabled
-                    prefs.edit().putBoolean("amoled_black", enabled).apply()
-                },
-                onToggleNsfw = { enabled ->
-                    allowNsfw = enabled
-                    prefs.edit().putBoolean("allow_nsfw", enabled).apply()
-                },
-                onOpenLogin = { showLoginScreen = true },
-                onSaveManualCookies = { token, csrf ->
-                    prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
-                    authToken = token
-                    ct0 = csrf
-                    XApiClient.clearCache()
-                },
-                onLogout = {
-                    prefs.edit().remove("auth_token").remove("ct0").apply()
-                    CookieManager.getInstance().removeAllCookies(null)
-                    XApiClient.clearCache()
-                    authToken = null
-                    ct0 = null
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (showLoginScreen) {
+                BackHandler { showLoginScreen = false }
+                XNativeAuthScreen(
+                    onAuthenticated = { token, csrf ->
+                        prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                        authToken = token
+                        ct0 = csrf
+                        showLoginScreen = false
+                    },
+                    onSkip = { showLoginScreen = false }
+                )
+            } else {
+                NativeBitXApp(
+                    authToken = authToken,
+                    ct0 = ct0,
+                    amoledBlack = amoledBlack,
+                    allowNsfw = allowNsfw,
+                    onToggleAmoled = { enabled ->
+                        amoledBlack = enabled
+                        prefs.edit().putBoolean("amoled_black", enabled).apply()
+                    },
+                    onToggleNsfw = { enabled ->
+                        allowNsfw = enabled
+                        prefs.edit().putBoolean("allow_nsfw", enabled).apply()
+                    },
+                    onOpenLogin = { showLoginScreen = true },
+                    onSaveManualCookies = { token, csrf ->
+                        prefs.edit().putString("auth_token", token).putString("ct0", csrf).apply()
+                        authToken = token
+                        ct0 = csrf
+                        XApiClient.clearCache()
+                    },
+                    onLogout = {
+                        prefs.edit().remove("auth_token").remove("ct0").apply()
+                        CookieManager.getInstance().removeAllCookies(null)
+                        XApiClient.clearCache()
+                        authToken = null
+                        ct0 = null
+                    }
+                )
+            }
+
+            // Full-Screen Update Banner whenever a newer build exists on launch
+            if (startupUpdate != null) {
+                FullScreenUpdateBanner(
+                    currentVersion = currentVersion,
+                    updateInfo = startupUpdate!!,
+                    onDismiss = { startupUpdate = null }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun FullScreenUpdateBanner(
+    currentVersion: String,
+    updateInfo: UpdateInfo,
+    onDismiss: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var downloading by remember { mutableStateOf(false) }
+    var failed by remember { mutableStateOf(false) }
+
+    BackHandler { if (!downloading) onDismiss() }
+
+    Surface(
+        color = colors.surface,
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(horizontal = 24.dp, vertical = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Surface(
+                    color = colors.primaryContainer,
+                    shape = RoundedCornerShape(32.dp),
+                    modifier = Modifier.size(96.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.SystemUpdate,
+                            contentDescription = null,
+                            tint = colors.onPrimaryContainer,
+                            modifier = Modifier.size(48.dp)
+                        )
+                    }
                 }
-            )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Text(
+                    text = "New bitX Update!",
+                    color = colors.onSurface,
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.Black,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Surface(
+                    color = colors.secondaryContainer,
+                    shape = CircleShape
+                ) {
+                    Text(
+                        text = "v$currentVersion  ->  v${updateInfo.versionTag}",
+                        color = colors.onSecondaryContainer,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                ElevatedCard(
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.elevatedCardColors(containerColor = colors.surfaceContainerLow),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Text("What's New", color = colors.primary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = updateInfo.notes,
+                            color = colors.onSurfaceVariant,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
+                        )
+                    }
+                }
+
+                if (failed) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("Download failed. Try again.", color = colors.error, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    enabled = !downloading,
+                    onClick = {
+                        scope.launch {
+                            downloading = true
+                            failed = false
+                            val ok = UpdateManager.downloadAndInstall(context, updateInfo.apkUrl)
+                            if (!ok) failed = true
+                            downloading = false
+                        }
+                    },
+                    shape = RoundedCornerShape(22.dp),
+                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) {
+                    if (downloading) {
+                        CircularProgressIndicator(
+                            color = colors.onPrimary,
+                            strokeWidth = 2.5.dp,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text("Downloading APK...", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    } else {
+                        Icon(Icons.Filled.Download, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Update Now", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                FilledTonalButton(
+                    enabled = !downloading,
+                    onClick = onDismiss,
+                    shape = RoundedCornerShape(22.dp),
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Text("Not Now", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
         }
     }
 }
@@ -541,7 +704,6 @@ fun XNativeAuthScreen(
 @Composable
 fun NativeVideoPlayer(
     videoUrl: String,
-    autoPlay: Boolean,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -556,12 +718,8 @@ fun NativeVideoPlayer(
                 repeatMode = Player.REPEAT_MODE_ONE
                 volume = 1f
                 prepare()
-                playWhenReady = autoPlay
+                playWhenReady = true
             }
-    }
-
-    LaunchedEffect(autoPlay) {
-        exoPlayer.playWhenReady = autoPlay
     }
 
     DisposableEffect(videoUrl) {
@@ -663,6 +821,111 @@ fun NativeBitXApp(
 
     LaunchedEffect(selectedTab, isLoggedIn) {
         if (selectedTab == BitXTab.SEARCH) {
+            if (!hasSearched) {
+                tweets = emptyList()
+                errorMsg = null
+                isLoading = false
+            }
+        } else if (selectedTab != BitXTab.SAVED) {
+            loadTab(selectedTab)
+        }
+    }
+
+    if (activeCommentsTweet != null) {
+        BackHandler { activeCommentsTweet = null }
+        CommentsScreen(
+            parentTweet = activeCommentsTweet!!,
+            allowNsfw = allowNsfw,
+            savedIds = savedPosts.map { it.id }.toSet(),
+            onToggleSave = ::toggleSavePost,
+            onBack = { activeCommentsTweet = null }
+        )
+        return
+    }
+
+    if (showSettings) {
+        BackHandler { showSettings = false }
+        SettingsScreen(
+            isLoggedIn = isLoggedIn,
+            amoledBlack = amoledBlack,
+            allowNsfw = allowNsfw,
+            onToggleAmoled = onToggleAmoled,
+            onToggleNsfw = onToggleNsfw,
+            onClearCache = {
+                XApiClient.clearCache()
+                showSettings = false
+                loadTab(selectedTab)
+            },
+            onOpenLogin = {
+                showSettings = false
+                onOpenLogin()
+            },
+            onSaveManualCookies = { token, csrf ->
+                onSaveManualCookies(token, csrf)
+                showSettings = false
+            },
+            onLogout = onLogout,
+            onBack = { showSettings = false }
+        )
+        return
+    }
+
+    val savedIdSet = remember(savedPosts) { savedPosts.map { it.id }.toSet() }
+    val displayedTweets = remember(tweets, selectedTab, videosOnly) {
+        if (selectedTab == BitXTab.SEARCH && videosOnly) {
+            tweets.filter { it.isVideo || !it.videoUrl.isNullOrBlank() || !it.embedVideoUrl.isNullOrBlank() }
+        } else {
+            tweets
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(colors.surface)) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Surface(
+                color = colors.surfaceContainer,
+                tonalElevation = 4.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(color = colors.primaryContainer, shape = RoundedCornerShape(16.dp)) {
+                            Text(
+                                "bitX",
+                                color = colors.onPrimaryContainer,
+                                fontWeight = FontWeight.Black,
+                                fontSize = 18.sp,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(selectedTab.label, color = colors.onSurface, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (isLoggedIn) {
+                            FilledTonalIconButton(onClick = { loadTab(selectedTab) }) {
+                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                            }
+                        } else {
+                            FilledTonalButton(onClick = onOpenLogin) {
+                                Text("Sign In", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        FilledTonalIconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                        }
+                    }
+                }
+            }
+
+            if (selectedTab == BitXTab.SEARCH) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
                     OutlinedTextField(
                         value = searchQuery,
@@ -724,7 +987,6 @@ fun NativeBitXApp(
                         }
                     }
                     selectedTab == BitXTab.SEARCH && !hasSearched -> {
-                        // Clean Search page: show nothing until user searches
                         Box(modifier = Modifier.fillMaxSize())
                     }
                     isLoading -> {
@@ -749,15 +1011,19 @@ fun NativeBitXApp(
                         }
                     }
                     else -> {
-                        if (tweets.isEmpty()) {
-                            Text("No posts found.", color = colors.onSurfaceVariant, modifier = Modifier.align(Alignment.Center))
+                        if (displayedTweets.isEmpty()) {
+                            Text(
+                                text = if (videosOnly) "No playable videos in these results." else "No posts found.",
+                                color = colors.onSurfaceVariant,
+                                modifier = Modifier.align(Alignment.Center)
+                            )
                         } else {
                             LazyColumn(
                                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 104.dp),
                                 verticalArrangement = Arrangement.spacedBy(10.dp),
                                 modifier = Modifier.fillMaxSize()
                             ) {
-                                val displayed = if (selectedTab == BitXTab.SEARCH && videosOnly) tweets.filter { it.isVideo || !it.videoUrl.isNullOrBlank() || !it.embedVideoUrl.isNullOrBlank() } else tweets; items(displayed, key = { it.id }) { tweet ->
+                                items(displayedTweets, key = { it.id }) { tweet ->
                                     MaterialYouTweetCard(
                                         tweet = tweet,
                                         allowNsfw = allowNsfw,
@@ -773,7 +1039,7 @@ fun NativeBitXApp(
             }
         }
 
-        // Floating Material You Pill Navigation Bar
+        // Floating Material You Pill Navigation Bar (Home, Search, Saved)
         Surface(
             color = colors.surfaceContainerHigh,
             tonalElevation = 8.dp,
@@ -782,7 +1048,7 @@ fun NativeBitXApp(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(horizontal = 16.dp, vertical = 14.dp)
+                .padding(horizontal = 20.dp, vertical = 14.dp)
                 .fillMaxWidth()
         ) {
             Row(
@@ -797,7 +1063,7 @@ fun NativeBitXApp(
                             .clip(CircleShape)
                             .background(if (selected) colors.primaryContainer else Color.Transparent)
                             .clickable { selectedTab = tab }
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                            .padding(horizontal = 18.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -1194,13 +1460,14 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(18.dp)) {
                     Text("bitX", color = colors.onPrimaryContainer, fontWeight = FontWeight.Black, fontSize = 20.sp)
-                    Text("Version $currentVersion ? Built by Alex Desrosier (@cashhwocky)", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
+                    Text("Version $currentVersion - Built by Alex Desrosier (@cashhwocky)", color = colors.onPrimaryContainer.copy(alpha = 0.85f), fontSize = 13.sp)
                 }
             }
         }
     }
 }
 
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun MaterialYouTweetCard(
     tweet: NativeTweet,
@@ -1211,7 +1478,11 @@ fun MaterialYouTweetCard(
 ) {
     val colors = MaterialTheme.colorScheme
     var manuallyRevealed by remember(tweet.id) { mutableStateOf(false) }
+    var isPlayingVideo by remember(tweet.id) { mutableStateOf(false) }
     val showMedia = !tweet.isSensitive || allowNsfw || manuallyRevealed
+    val hasDirectVideo = !tweet.videoUrl.isNullOrBlank()
+    val hasEmbedVideo = !tweet.embedVideoUrl.isNullOrBlank()
+    val hasAnyMedia = hasDirectVideo || hasEmbedVideo || tweet.mediaUrls.isNotEmpty()
 
     ElevatedCard(
         shape = RoundedCornerShape(24.dp),
@@ -1251,7 +1522,7 @@ fun MaterialYouTweetCard(
                 Text(tweet.text, color = colors.onSurface, fontSize = 15.sp, lineHeight = 21.sp)
             }
 
-            if (!tweet.videoUrl.isNullOrBlank() || tweet.mediaUrls.isNotEmpty()) {
+            if (hasAnyMedia) {
                 Spacer(modifier = Modifier.height(12.dp))
                 if (!showMedia) {
                     Surface(
@@ -1276,41 +1547,46 @@ fun MaterialYouTweetCard(
                             Text("Tap to reveal (or enable NSFW in Settings)", color = colors.onSurfaceVariant, fontSize = 12.sp)
                         }
                     }
-                } else if (!tweet.videoUrl.isNullOrBlank()) {
-                    NativeVideoPlayer(
-                        videoUrl = tweet.videoUrl,
-                        autoPlay = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(260.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                    )
-                } else if (!tweet.embedVideoUrl.isNullOrBlank()) {
-                    var playingEmbed by remember(tweet.id) { mutableStateOf(false) }
-                    if (playingEmbed) {
-                        AndroidView(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(260.dp)
-                                .clip(RoundedCornerShape(18.dp)),
-                            factory = { ctx ->
-                                WebView(ctx).apply {
-                                    settings.javaScriptEnabled = true
-                                    settings.domStorageEnabled = true
-                                    settings.mediaPlaybackRequiresUserGesture = false
-                                    webChromeClient = WebChromeClient()
-                                    webViewClient = WebViewClient()
-                                    loadUrl(tweet.embedVideoUrl)
+                } else if (hasDirectVideo || hasEmbedVideo) {
+                    if (isPlayingVideo) {
+                        if (hasDirectVideo) {
+                            NativeVideoPlayer(
+                                videoUrl = tweet.videoUrl!!,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(260.dp)
+                                    .clip(RoundedCornerShape(18.dp))
+                            )
+                        } else {
+                            AndroidView(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(260.dp)
+                                    .clip(RoundedCornerShape(18.dp)),
+                                factory = { ctx ->
+                                    WebView(ctx).apply {
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT
+                                        )
+                                        settings.javaScriptEnabled = true
+                                        settings.domStorageEnabled = true
+                                        settings.mediaPlaybackRequiresUserGesture = false
+                                        webChromeClient = WebChromeClient()
+                                        webViewClient = WebViewClient()
+                                        loadUrl(tweet.embedVideoUrl!!)
+                                    }
                                 }
-                            }
-                        )
+                            )
+                        }
                     } else {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(240.dp)
                                 .clip(RoundedCornerShape(18.dp))
-                                .clickable { playingEmbed = true },
+                                .background(colors.surfaceContainerHighest)
+                                .clickable { isPlayingVideo = true },
                             contentAlignment = Alignment.Center
                         ) {
                             if (tweet.mediaUrls.isNotEmpty()) {
@@ -1320,21 +1596,19 @@ fun MaterialYouTweetCard(
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier.fillMaxSize()
                                 )
-                            } else {
-                                Box(modifier = Modifier.fillMaxSize().background(colors.surfaceContainerHighest))
                             }
                             Surface(
-                                color = colors.primaryContainer.copy(alpha = 0.92f),
+                                color = colors.primaryContainer.copy(alpha = 0.94f),
                                 shape = CircleShape,
                                 shadowElevation = 6.dp
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(Icons.Filled.PlayArrow, contentDescription = "Play", tint = colors.onPrimaryContainer)
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Play Video", color = colors.onPrimaryContainer, fontWeight = FontWeight.Bold)
+                                    Text("Play Video", color = colors.onPrimaryContainer, fontWeight = FontWeight.ExtraBold)
                                 }
                             }
                         }
@@ -1414,5 +1688,3 @@ fun StatPill(
         }
     }
 }
-
-

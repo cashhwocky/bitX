@@ -20,18 +20,34 @@ object UpdateManager {
     private val client = OkHttpClient()
     private const val REPO = "cashhwocky/bitX"
 
+    private fun isNewer(remote: String, current: String): Boolean {
+        val rParts = remote.split(".").mapNotNull { it.toIntOrNull() }
+        val cParts = current.split(".").mapNotNull { it.toIntOrNull() }
+        if (rParts.isNotEmpty() && cParts.isNotEmpty()) {
+            val maxLen = maxOf(rParts.size, cParts.size)
+            for (i in 0 until maxLen) {
+                val r = rParts.getOrElse(i) { 0 }
+                val c = cParts.getOrElse(i) { 0 }
+                if (r != c) return r > c
+            }
+            return false
+        }
+        return remote != current
+    }
+
     suspend fun checkForUpdate(currentVersion: String): UpdateInfo? = withContext(Dispatchers.IO) {
         try {
             val req = Request.Builder()
                 .url("https://api.github.com/repos/$REPO/releases/latest")
                 .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "bitX-Updater")
                 .build()
 
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext null
                 val json = JSONObject(resp.body?.string().orEmpty())
-                val tag = json.optString("tag_name").removePrefix("v")
-                val notes = json.optString("body", "New bitX update available.")
+                val tag = json.optString("tag_name").removePrefix("v").trim()
+                val notes = json.optString("body").ifBlank { "A new version of bitX is ready to install." }
                 val assets = json.optJSONArray("assets") ?: return@withContext null
 
                 var apkUrl: String? = null
@@ -43,7 +59,7 @@ object UpdateManager {
                     }
                 }
 
-                if (tag.isNotBlank() && tag != currentVersion && !apkUrl.isNullOrBlank()) {
+                if (tag.isNotBlank() && !apkUrl.isNullOrBlank() && isNewer(tag, currentVersion)) {
                     UpdateInfo(tag, apkUrl, notes)
                 } else null
             }
