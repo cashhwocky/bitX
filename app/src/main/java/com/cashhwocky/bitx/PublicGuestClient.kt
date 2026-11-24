@@ -1,16 +1,22 @@
 package com.cashhwocky.bitx
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 object PublicGuestClient {
-    private val client = OkHttpClient()
-    private const val UA = "bitX/2.0 (Android; +https://github.com/cashhwocky/bitX)"
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+    private const val UA = "bitX/3.0 (Android; +https://github.com/cashhwocky/bitX)"
     private var homeRefreshCount = 0
 
     private fun stripHtml(html: String, stripTrailingUrls: Boolean): String {
@@ -37,7 +43,6 @@ object PublicGuestClient {
     }
 
     private fun parseStatus(rawItem: JSONObject, fallbackId: String): NativeTweet? {
-        // Unwrap boosts/reblogs so media_attachments are never missed
         val item = rawItem.optJSONObject("reblog") ?: rawItem
         val account = item.optJSONObject("account") ?: return null
         val mediaList = mutableListOf<String>()
@@ -72,19 +77,12 @@ object PublicGuestClient {
             }
         }
 
-        // Check link preview card (treated as external website link with warning popup)
         val card = item.optJSONObject("card")
         if (card != null && videoUrl == null) {
             val cardUrl = card.optString("url").takeIf { it.isNotBlank() && it != "null" }
             val cardImg = card.optString("image").takeIf { it.isNotBlank() && it != "null" }
             if (cardImg != null && mediaList.isEmpty()) mediaList.add(cardImg)
-            if (cardUrl != null) {
-                externalUrl = cardUrl
-                val cardType = card.optString("type").lowercase()
-                if (cardType == "video" || cardUrl.contains("youtube.com") || cardUrl.contains("youtu.be") || cardUrl.contains("vimeo.com") || cardUrl.contains("redgifs.com")) {
-                    isVideo = true
-                }
-            }
+            if (cardUrl != null) externalUrl = cardUrl
         }
 
         val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty() || videoUrl != null)
@@ -105,53 +103,75 @@ object PublicGuestClient {
             replies = item.optInt("replies_count", 0),
             isVideo = isVideo,
             isSensitive = item.optBoolean("sensitive", false),
-            spoilerText = item.optString("spoiler_text", "")
+            spoilerText = item.optString("spoiler_text", ""),
+            source = FeedSource.PUBLIC
         )
     }
 
-    suspend fun fetchFeed(tab: BitXTab, query: String = "", forceFresh: Boolean = false): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
-        try {
-            val url = when (tab) {
-                BitXTab.HOME -> {
-                    if (forceFresh) homeRefreshCount++
-                    when (homeRefreshCount % 3) {
-                        0 -> "https://mastodon.social/api/v1/trends/statuses?limit=30"
-                        1 -> "https://mastodon.social/api/v1/timelines/public?limit=30"
-                        else -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=30"
-                    }
-                }
-                BitXTab.SAVED -> return@withContext Result.success(emptyList())
-                BitXTab.SEARCH -> {
-                    val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
-                    if (cleanTag.isBlank()) return@withContext Result.success(emptyList())
-                    val encoded = URLEncoder.encode(cleanTag, "UTF-8")
-                    "https://mastodon.social/api/v1/timelines/tag/$encoded?only_media=true&limit=40"
-                }
-            }
-
+    private fun fetchUrl(url: String): Result<List<NativeTweet>> {
+        return try {
             val req = Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
                 .header("User-Agent", UA)
                 .build()
-
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    return@withContext Result.failure(Exception("Public feed error: HTTP ${resp.code}"))
-                }
+                if (!resp.isSuccessful) return Result.failure(Exception("HTTP ${resp.code}"))
                 val arr = JSONArray(body)
                 val list = mutableListOf<NativeTweet>()
                 for (i in 0 until arr.length()) {
                     val item = arr.optJSONObject(i) ?: continue
                     parseStatus(item, i.toString())?.let { list.add(it) }
                 }
-                val final = if (forceFresh && tab == BitXTab.HOME) list.shuffled() else list
-                Result.success(final)
+                Result.success(list)
             }
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    suspend fun fetchFeed(tab: BitXTab, query: String = "", forceFresh: Boolean = false): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
+        val urls = when (tab) {
+            BitXTab.HOME -> {
+                if (forceFresh) homeRefreshCount++
+                val primary = when (homeRefreshCount % 3) {
+                    0 -> "https://mastodon.social/api/v1/trends/statuses?limit=30"
+                    1 -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=30"
+                    else -> "https://mastodon.social/api/v1/timelines/public?limit=30"
+                }
+                listOf(
+                    primary,
+                    "https://mastodon.social/api/v1/trends/statuses?limit=30",
+                    "https://mstdn.social/api/v1/trends/statuses?limit=25"
+                )
+            }
+            BitXTab.SAVED -> return@withContext Result.success(emptyList())
+            BitXTab.SEARCH -> {
+                val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
+                if (cleanTag.isBlank()) return@withContext Result.success(emptyList())
+                val encoded = URLEncoder.encode(cleanTag, "UTF-8")
+                listOf(
+                    "https://mastodon.social/api/v1/timelines/tag/$encoded?only_media=true&limit=40",
+                    "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=35"
+                )
+            }
+        }
+
+        var lastErr: Throwable = Exception("Network error")
+        for (url in urls) {
+            val res = fetchUrl(url)
+            if (res.isSuccess) {
+                val list = res.getOrDefault(emptyList())
+                if (list.isNotEmpty() || url == urls.last()) {
+                    return@withContext Result.success(if (forceFresh && tab == BitXTab.HOME) list.shuffled() else list)
+                }
+            } else {
+                lastErr = res.exceptionOrNull() ?: lastErr
+                delay(250)
+            }
+        }
+        Result.failure(lastErr)
     }
 
     suspend fun fetchReplies(statusId: String): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
@@ -162,12 +182,9 @@ object PublicGuestClient {
                 .header("Accept", "application/json")
                 .header("User-Agent", UA)
                 .build()
-
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    return@withContext Result.failure(Exception("Comments error: HTTP ${resp.code}"))
-                }
+                if (!resp.isSuccessful) return@withContext Result.failure(Exception("Comments HTTP ${resp.code}"))
                 val descendants = JSONObject(body).optJSONArray("descendants") ?: JSONArray()
                 val list = mutableListOf<NativeTweet>()
                 for (i in 0 until descendants.length()) {
@@ -181,4 +198,3 @@ object PublicGuestClient {
         }
     }
 }
-
