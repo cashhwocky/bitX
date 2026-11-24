@@ -33,30 +33,34 @@ object PublicGuestClient {
         val account = item.optJSONObject("account") ?: return null
         val mediaList = mutableListOf<String>()
         var isVideo = false
+        var videoUrl: String? = null
 
         val mediaArr = item.optJSONArray("media_attachments")
         if (mediaArr != null) {
             for (j in 0 until mediaArr.length()) {
                 val m = mediaArr.optJSONObject(j) ?: continue
                 val type = m.optString("type")
-                if (type in listOf("video", "gifv")) isVideo = true
-                val bestUrl = if (type == "image") {
-                    m.optString("url").takeIf { it.isNotBlank() } ?: m.optString("preview_url")
+                if (type in listOf("video", "gifv")) {
+                    isVideo = true
+                    if (videoUrl == null) {
+                        videoUrl = m.optString("url").takeIf { it.isNotBlank() }
+                    }
+                    val thumb = m.optString("preview_url").takeIf { it.isNotBlank() }
+                    if (thumb != null) mediaList.add(thumb)
                 } else {
-                    m.optString("preview_url").takeIf { it.isNotBlank() } ?: m.optString("url")
+                    val bestUrl = m.optString("url").takeIf { it.isNotBlank() } ?: m.optString("preview_url")
+                    if (!bestUrl.isNullOrBlank()) mediaList.add(bestUrl)
                 }
-                if (!bestUrl.isNullOrBlank()) mediaList.add(bestUrl)
             }
         }
 
-        // Fallback to link preview card image if no direct media attachment
-        if (mediaList.isEmpty()) {
+        if (mediaList.isEmpty() && videoUrl == null) {
             val cardImg = item.optJSONObject("card")?.optString("image")?.takeIf { it.isNotBlank() }
             if (cardImg != null) mediaList.add(cardImg)
         }
 
-        val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty())
-        if (text.isBlank() && mediaList.isEmpty()) return null
+        val text = stripHtml(item.optString("content", ""), stripTrailingUrls = mediaList.isNotEmpty() || videoUrl != null)
+        if (text.isBlank() && mediaList.isEmpty() && videoUrl == null) return null
 
         return NativeTweet(
             id = item.optString("id", fallbackId),
@@ -66,6 +70,7 @@ object PublicGuestClient {
             text = text,
             mediaUrl = mediaList.firstOrNull(),
             mediaUrls = mediaList,
+            videoUrl = videoUrl,
             likes = item.optInt("favourites_count", 0),
             retweets = item.optInt("reblogs_count", 0),
             replies = item.optInt("replies_count", 0),
@@ -79,16 +84,13 @@ object PublicGuestClient {
         try {
             val url = when (tab) {
                 BitXTab.HOME -> "https://mastodon.social/api/v1/trends/statuses?limit=30"
-                BitXTab.CLIPS -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=30"
-                BitXTab.SAVED -> "https://mastodon.social/api/v1/timelines/tag/android?limit=30"
+                BitXTab.CLIPS -> "https://mastodon.social/api/v1/timelines/public?only_media=true&limit=40"
+                BitXTab.SAVED -> return@withContext Result.success(emptyList())
                 BitXTab.SEARCH -> {
                     val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
-                    if (cleanTag.isBlank()) {
-                        "https://mastodon.social/api/v1/trends/statuses?limit=30"
-                    } else {
-                        val encoded = URLEncoder.encode(cleanTag, "UTF-8")
-                        "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=30"
-                    }
+                    if (cleanTag.isBlank()) return@withContext Result.success(emptyList())
+                    val encoded = URLEncoder.encode(cleanTag, "UTF-8")
+                    "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=30"
                 }
             }
 
@@ -109,8 +111,13 @@ object PublicGuestClient {
                     val item = arr.optJSONObject(i) ?: continue
                     parseStatus(item, i.toString())?.let { list.add(it) }
                 }
-                val filtered = if (tab == BitXTab.CLIPS) list.filter { it.mediaUrls.isNotEmpty() } else list
-                Result.success(filtered)
+                val final = if (tab == BitXTab.CLIPS) {
+                    val videosOnly = list.filter { !it.videoUrl.isNullOrBlank() }
+                    if (videosOnly.isNotEmpty()) videosOnly else list.filter { it.mediaUrls.isNotEmpty() }
+                } else {
+                    list
+                }
+                Result.success(final)
             }
         } catch (e: Exception) {
             Result.failure(e)

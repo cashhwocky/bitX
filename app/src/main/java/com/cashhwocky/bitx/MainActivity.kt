@@ -26,6 +26,8 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -42,11 +44,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -54,6 +62,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -65,6 +74,7 @@ data class NativeTweet(
     val text: String,
     val mediaUrl: String?,
     val mediaUrls: List<String> = listOfNotNull(mediaUrl),
+    val videoUrl: String? = null,
     val likes: Int,
     val retweets: Int,
     val replies: Int,
@@ -82,6 +92,73 @@ enum class BitXTab(
     SEARCH("Search", Icons.Filled.Search, Icons.Outlined.Search),
     SAVED("Saved", Icons.Filled.Bookmark, Icons.Outlined.BookmarkBorder),
     CLIPS("Clips", Icons.Filled.PlayCircle, Icons.Outlined.PlayCircleOutline)
+}
+
+object SavedPostsStore {
+    private const val PREF_KEY = "saved_posts_json"
+
+    fun load(context: Context): List<NativeTweet> {
+        val raw = context.getSharedPreferences("bitx_saved", Context.MODE_PRIVATE)
+            .getString(PREF_KEY, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            val list = mutableListOf<NativeTweet>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val mediaArr = o.optJSONArray("mediaUrls")
+                val urls = mutableListOf<String>()
+                if (mediaArr != null) {
+                    for (j in 0 until mediaArr.length()) urls.add(mediaArr.getString(j))
+                }
+                list.add(
+                    NativeTweet(
+                        id = o.getString("id"),
+                        authorName = o.getString("authorName"),
+                        handle = o.getString("handle"),
+                        avatarUrl = o.optString("avatarUrl", ""),
+                        text = o.optString("text", ""),
+                        mediaUrl = o.optString("mediaUrl").takeIf { it.isNotBlank() },
+                        mediaUrls = urls,
+                        videoUrl = o.optString("videoUrl").takeIf { it.isNotBlank() },
+                        likes = o.optInt("likes", 0),
+                        retweets = o.optInt("retweets", 0),
+                        replies = o.optInt("replies", 0),
+                        isVideo = o.optBoolean("isVideo", false),
+                        isSensitive = o.optBoolean("isSensitive", false),
+                        spoilerText = o.optString("spoilerText", "")
+                    )
+                )
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun save(context: Context, list: List<NativeTweet>) {
+        val arr = JSONArray()
+        list.forEach { t ->
+            val o = JSONObject().apply {
+                put("id", t.id)
+                put("authorName", t.authorName)
+                put("handle", t.handle)
+                put("avatarUrl", t.avatarUrl)
+                put("text", t.text)
+                put("mediaUrl", t.mediaUrl ?: "")
+                put("mediaUrls", JSONArray(t.mediaUrls))
+                put("videoUrl", t.videoUrl ?: "")
+                put("likes", t.likes)
+                put("retweets", t.retweets)
+                put("replies", t.replies)
+                put("isVideo", t.isVideo)
+                put("isSensitive", t.isSensitive)
+                put("spoilerText", t.spoilerText)
+            }
+            arr.put(o)
+        }
+        context.getSharedPreferences("bitx_saved", Context.MODE_PRIVATE)
+            .edit().putString(PREF_KEY, arr.toString()).apply()
+    }
 }
 
 object XApiClient {
@@ -132,6 +209,7 @@ object XApiClient {
         query: String = ""
     ): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
+            if (tab == BitXTab.SAVED) return@withContext Result.success(emptyList())
             resolveQueryIds(authToken, ct0)
 
             val (opName, varsJson) = when (tab) {
@@ -141,7 +219,8 @@ object XApiClient {
                 }
                 BitXTab.SAVED -> "Bookmarks" to """{"count":30,"includePromotedContent":false}"""
                 BitXTab.SEARCH -> {
-                    val q = query.ifBlank { "Android OR Pixel" }.replace("\"", "")
+                    val q = query.trim().replace("\"", "")
+                    if (q.isBlank()) return@withContext Result.success(emptyList())
                     "SearchTimeline" to """{"rawQuery":"$q","count":25,"querySource":"typed_query","product":"Top"}"""
                 }
             }
@@ -171,7 +250,8 @@ object XApiClient {
                 }
                 val parsed = parseTweetsDeep(body)
                 val finalTweets = if (tab == BitXTab.CLIPS) {
-                    parsed.filter { it.mediaUrls.isNotEmpty() }
+                    val videosOnly = parsed.filter { !it.videoUrl.isNullOrBlank() }
+                    if (videosOnly.isNotEmpty()) videosOnly else parsed.filter { it.mediaUrls.isNotEmpty() }
                 } else {
                     parsed
                 }
@@ -201,15 +281,32 @@ object XApiClient {
                                 val mediaArr = legacy.optJSONObject("extended_entities")?.optJSONArray("media")
                                 val mediaList = mutableListOf<String>()
                                 var isVideo = false
+                                var videoUrl: String? = null
                                 if (mediaArr != null) {
                                     for (i in 0 until mediaArr.length()) {
                                         val m = mediaArr.optJSONObject(i) ?: continue
                                         val mUrl = m.optString("media_url_https")
                                         if (mUrl.isNotBlank()) mediaList.add(mUrl)
-                                        if (m.optString("type") in listOf("video", "animated_gif")) isVideo = true
+                                        if (m.optString("type") in listOf("video", "animated_gif")) {
+                                            isVideo = true
+                                            val variants = m.optJSONObject("video_info")?.optJSONArray("variants")
+                                            if (variants != null) {
+                                                var bestBitrate = -1
+                                                for (v in 0 until variants.length()) {
+                                                    val vo = variants.optJSONObject(v) ?: continue
+                                                    if (vo.optString("content_type") == "video/mp4") {
+                                                        val br = vo.optInt("bitrate", 0)
+                                                        if (br >= bestBitrate) {
+                                                            bestBitrate = br
+                                                            videoUrl = vo.optString("url")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                val cleanText = if (mediaList.isNotEmpty()) {
+                                val cleanText = if (mediaList.isNotEmpty() || videoUrl != null) {
                                     rawText.replace(Regex("https://t\\.co/\\S+"), "").trim()
                                 } else rawText
 
@@ -222,6 +319,7 @@ object XApiClient {
                                         text = cleanText,
                                         mediaUrl = mediaList.firstOrNull(),
                                         mediaUrls = mediaList,
+                                        videoUrl = videoUrl,
                                         likes = legacy.optInt("favorite_count", 0),
                                         retweets = legacy.optInt("retweet_count", 0),
                                         replies = legacy.optInt("reply_count", 0),
@@ -235,7 +333,7 @@ object XApiClient {
                     val keys = node.keys()
                     while (keys.hasNext()) walk(node.opt(keys.next()))
                 }
-                is org.json.JSONArray -> {
+                is JSONArray -> {
                     for (i in 0 until node.length()) walk(node.opt(i))
                 }
             }
@@ -441,6 +539,47 @@ fun XNativeAuthScreen(
 }
 
 @Composable
+fun NativeVideoPlayer(
+    videoUrl: String,
+    autoPlay: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val exoPlayer = remember(videoUrl) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(videoUrl))
+            repeatMode = Player.REPEAT_MODE_ONE
+            prepare()
+            playWhenReady = autoPlay
+        }
+    }
+
+    LaunchedEffect(autoPlay) {
+        exoPlayer.playWhenReady = autoPlay
+    }
+
+    DisposableEffect(videoUrl) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            PlayerView(ctx).apply {
+                player = exoPlayer
+                useController = true
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+        }
+    )
+}
+
+@Composable
 fun NativeBitXApp(
     authToken: String?,
     ct0: String?,
@@ -452,18 +591,45 @@ fun NativeBitXApp(
     onSaveManualCookies: (String, String) -> Unit,
     onLogout: () -> Unit
 ) {
+    val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
+    val keyboardController = LocalSoftwareKeyboardController.current
     val isLoggedIn = !authToken.isNullOrBlank() && !ct0.isNullOrBlank()
+
     var selectedTab by remember { mutableStateOf(BitXTab.HOME) }
     var showSettings by remember { mutableStateOf(false) }
     var activeCommentsTweet by remember { mutableStateOf<NativeTweet?>(null) }
     var tweets by remember { mutableStateOf<List<NativeTweet>>(emptyList()) }
+    var savedPosts by remember { mutableStateOf(SavedPostsStore.load(context)) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
     var searchQuery by remember { mutableStateOf("") }
+    var hasSearched by remember { mutableStateOf(false) }
+
+    fun toggleSavePost(tweet: NativeTweet) {
+        val exists = savedPosts.any { it.id == tweet.id }
+        val updated = if (exists) {
+            savedPosts.filterNot { it.id == tweet.id }
+        } else {
+            listOf(tweet) + savedPosts
+        }
+        savedPosts = updated
+        SavedPostsStore.save(context, updated)
+    }
 
     fun loadTab(tab: BitXTab, q: String = searchQuery) {
+        if (tab == BitXTab.SAVED) {
+            isLoading = false
+            errorMsg = null
+            return
+        }
+        if (tab == BitXTab.SEARCH && q.isBlank()) {
+            isLoading = false
+            errorMsg = null
+            tweets = emptyList()
+            return
+        }
         scope.launch {
             isLoading = true
             errorMsg = null
@@ -479,13 +645,34 @@ fun NativeBitXApp(
         }
     }
 
-    LaunchedEffect(selectedTab, isLoggedIn) { loadTab(selectedTab) }
+    fun executeSearch() {
+        val trimmed = searchQuery.trim()
+        if (trimmed.isNotBlank()) {
+            hasSearched = true
+            keyboardController?.hide()
+            loadTab(BitXTab.SEARCH, trimmed)
+        }
+    }
+
+    LaunchedEffect(selectedTab, isLoggedIn) {
+        if (selectedTab == BitXTab.SEARCH) {
+            if (!hasSearched) {
+                tweets = emptyList()
+                errorMsg = null
+                isLoading = false
+            }
+        } else if (selectedTab != BitXTab.SAVED) {
+            loadTab(selectedTab)
+        }
+    }
 
     if (activeCommentsTweet != null) {
         BackHandler { activeCommentsTweet = null }
         CommentsScreen(
             parentTweet = activeCommentsTweet!!,
             allowNsfw = allowNsfw,
+            savedIds = savedPosts.map { it.id }.toSet(),
+            onToggleSave = ::toggleSavePost,
             onBack = { activeCommentsTweet = null }
         )
         return
@@ -517,6 +704,8 @@ fun NativeBitXApp(
         )
         return
     }
+
+    val savedIdSet = remember(savedPosts) { savedPosts.map { it.id }.toSet() }
 
     Box(modifier = Modifier.fillMaxSize().background(colors.surface)) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -571,19 +760,55 @@ fun NativeBitXApp(
                     placeholder = { Text("Search tags or topics...") },
                     singleLine = true,
                     shape = RoundedCornerShape(28.dp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { executeSearch() }),
                     trailingIcon = {
-                        IconButton(onClick = { loadTab(BitXTab.SEARCH, searchQuery) }) {
-                            Icon(Icons.Filled.Search, contentDescription = "Go")
+                        IconButton(onClick = { executeSearch() }) {
+                            Icon(Icons.Filled.Search, contentDescription = "Search")
                         }
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
                 )
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    selectedTab == BitXTab.SAVED -> {
+                        if (savedPosts.isEmpty()) {
+                            Column(
+                                modifier = Modifier.align(Alignment.Center).padding(32.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(Icons.Outlined.BookmarkBorder, contentDescription = null, tint = colors.onSurfaceVariant, modifier = Modifier.size(48.dp))
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Text("No saved posts yet", color = colors.onSurface, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text("Tap the Save button on any post to keep it here.", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                            }
+                        } else {
+                            LazyColumn(
+                                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 104.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                items(savedPosts, key = { it.id }) { tweet ->
+                                    MaterialYouTweetCard(
+                                        tweet = tweet,
+                                        allowNsfw = allowNsfw,
+                                        isSaved = true,
+                                        onToggleSave = { toggleSavePost(tweet) },
+                                        onOpenComments = { activeCommentsTweet = tweet }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    selectedTab == BitXTab.SEARCH && !hasSearched -> {
+                        // Clean Search page: show nothing until user searches
+                        Box(modifier = Modifier.fillMaxSize())
+                    }
                     isLoading -> {
                         CircularProgressIndicator(
                             modifier = Modifier.align(Alignment.Center),
@@ -607,20 +832,29 @@ fun NativeBitXApp(
                     }
                     selectedTab == BitXTab.CLIPS -> {
                         if (tweets.isEmpty()) {
-                            Text("No media clips in timeline yet.", color = colors.onSurfaceVariant, modifier = Modifier.align(Alignment.Center))
+                            Text("No clips found right now.", color = colors.onSurfaceVariant, modifier = Modifier.align(Alignment.Center))
                         } else {
                             val pagerState = rememberPagerState(pageCount = { tweets.size })
                             VerticalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
                                 val clip = tweets[page]
+                                val isCurrent = pagerState.currentPage == page
                                 Box(modifier = Modifier.fillMaxSize().padding(bottom = 90.dp)) {
-                                    AsyncImage(
-                                        model = clip.mediaUrl,
-                                        contentDescription = null,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(28.dp))
-                                    )
+                                    if (!clip.videoUrl.isNullOrBlank()) {
+                                        NativeVideoPlayer(
+                                            videoUrl = clip.videoUrl,
+                                            autoPlay = isCurrent,
+                                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(28.dp))
+                                        )
+                                    } else {
+                                        AsyncImage(
+                                            model = clip.mediaUrl,
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(28.dp))
+                                        )
+                                    }
                                     Surface(
-                                        color = colors.surfaceContainerHigh.copy(alpha = 0.88f),
+                                        color = colors.surfaceContainerHigh.copy(alpha = 0.85f),
                                         shape = RoundedCornerShape(24.dp),
                                         modifier = Modifier
                                             .align(Alignment.BottomStart)
@@ -628,10 +862,23 @@ fun NativeBitXApp(
                                             .fillMaxWidth()
                                             .clickable { activeCommentsTweet = clip }
                                     ) {
-                                        Column(modifier = Modifier.padding(14.dp)) {
-                                            Text("${clip.authorName} ${clip.handle}", color = colors.primary, fontWeight = FontWeight.Bold)
-                                            Spacer(modifier = Modifier.height(4.dp))
-                                            Text(clip.text, color = colors.onSurface, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                                        Row(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text("${clip.authorName} ${clip.handle}", color = colors.primary, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Spacer(modifier = Modifier.height(4.dp))
+                                                Text(clip.text, color = colors.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                            }
+                                            IconButton(onClick = { toggleSavePost(clip) }) {
+                                                val saved = savedIdSet.contains(clip.id)
+                                                Icon(
+                                                    imageVector = if (saved) Icons.Filled.Bookmark else Icons.Outlined.BookmarkBorder,
+                                                    contentDescription = "Save",
+                                                    tint = if (saved) colors.primary else colors.onSurfaceVariant
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -639,17 +886,23 @@ fun NativeBitXApp(
                         }
                     }
                     else -> {
-                        LazyColumn(
-                            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 104.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                            modifier = Modifier.fillMaxSize()
-                        ) {
-                            items(tweets, key = { it.id }) { tweet ->
-                                MaterialYouTweetCard(
-                                    tweet = tweet,
-                                    allowNsfw = allowNsfw,
-                                    onOpenComments = { activeCommentsTweet = tweet }
-                                )
+                        if (tweets.isEmpty()) {
+                            Text("No posts found.", color = colors.onSurfaceVariant, modifier = Modifier.align(Alignment.Center))
+                        } else {
+                            LazyColumn(
+                                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 104.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                items(tweets, key = { it.id }) { tweet ->
+                                    MaterialYouTweetCard(
+                                        tweet = tweet,
+                                        allowNsfw = allowNsfw,
+                                        isSaved = savedIdSet.contains(tweet.id),
+                                        onToggleSave = { toggleSavePost(tweet) },
+                                        onOpenComments = { activeCommentsTweet = tweet }
+                                    )
+                                }
                             }
                         }
                     }
@@ -710,6 +963,8 @@ fun NativeBitXApp(
 fun CommentsScreen(
     parentTweet: NativeTweet,
     allowNsfw: Boolean,
+    savedIds: Set<String>,
+    onToggleSave: (NativeTweet) -> Unit,
     onBack: () -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
@@ -755,6 +1010,8 @@ fun CommentsScreen(
                 MaterialYouTweetCard(
                     tweet = parentTweet,
                     allowNsfw = allowNsfw,
+                    isSaved = savedIds.contains(parentTweet.id),
+                    onToggleSave = { onToggleSave(parentTweet) },
                     onOpenComments = {}
                 )
                 Spacer(modifier = Modifier.height(6.dp))
@@ -786,6 +1043,8 @@ fun CommentsScreen(
                     MaterialYouTweetCard(
                         tweet = reply,
                         allowNsfw = allowNsfw,
+                        isSaved = savedIds.contains(reply.id),
+                        onToggleSave = { onToggleSave(reply) },
                         onOpenComments = {}
                     )
                 }
@@ -928,7 +1187,7 @@ fun SettingsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Show NSFW / Sensitive Media", color = colors.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-                            Text("Always unhide sensitive posts and media in feeds & search", color = colors.onSurfaceVariant, fontSize = 13.sp)
+                            Text("Always unhide sensitive posts and videos in feeds & search", color = colors.onSurfaceVariant, fontSize = 13.sp)
                         }
                         Switch(checked = allowNsfw, onCheckedChange = onToggleNsfw)
                     }
@@ -1083,6 +1342,8 @@ fun SettingsScreen(
 fun MaterialYouTweetCard(
     tweet: NativeTweet,
     allowNsfw: Boolean,
+    isSaved: Boolean,
+    onToggleSave: () -> Unit,
     onOpenComments: () -> Unit
 ) {
     val colors = MaterialTheme.colorScheme
@@ -1127,7 +1388,7 @@ fun MaterialYouTweetCard(
                 Text(tweet.text, color = colors.onSurface, fontSize = 15.sp, lineHeight = 21.sp)
             }
 
-            if (tweet.mediaUrls.isNotEmpty()) {
+            if (!tweet.videoUrl.isNullOrBlank() || tweet.mediaUrls.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(12.dp))
                 if (!showMedia) {
                     Surface(
@@ -1152,6 +1413,15 @@ fun MaterialYouTweetCard(
                             Text("Tap to reveal (or enable NSFW in Settings)", color = colors.onSurfaceVariant, fontSize = 12.sp)
                         }
                     }
+                } else if (!tweet.videoUrl.isNullOrBlank()) {
+                    NativeVideoPlayer(
+                        videoUrl = tweet.videoUrl,
+                        autoPlay = false,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                    )
                 } else if (tweet.mediaUrls.size == 1) {
                     AsyncImage(
                         model = tweet.mediaUrls.first(),
@@ -1185,21 +1455,35 @@ fun MaterialYouTweetCard(
             Spacer(modifier = Modifier.height(12.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                StatPill(Icons.Outlined.ChatBubbleOutline, tweet.replies, onClick = onOpenComments)
-                StatPill(Icons.Outlined.Repeat, tweet.retweets)
-                StatPill(Icons.Outlined.FavoriteBorder, tweet.likes)
+                StatPill(Icons.Outlined.ChatBubbleOutline, tweet.replies.toString(), onClick = onOpenComments)
+                StatPill(Icons.Outlined.Repeat, tweet.retweets.toString())
+                StatPill(Icons.Outlined.FavoriteBorder, tweet.likes.toString())
+                StatPill(
+                    icon = if (isSaved) Icons.Filled.Bookmark else Icons.Outlined.BookmarkBorder,
+                    label = if (isSaved) "Saved" else "Save",
+                    highlighted = isSaved,
+                    onClick = onToggleSave
+                )
             }
         }
     }
 }
 
 @Composable
-fun StatPill(icon: ImageVector, count: Int, onClick: (() -> Unit)? = null) {
+fun StatPill(
+    icon: ImageVector,
+    label: String,
+    highlighted: Boolean = false,
+    onClick: (() -> Unit)? = null
+) {
     val colors = MaterialTheme.colorScheme
+    val bg = if (highlighted) colors.primaryContainer else colors.surfaceContainerHighest
+    val fg = if (highlighted) colors.onPrimaryContainer else colors.onSurfaceVariant
     Surface(
-        color = colors.surfaceContainerHighest,
+        color = bg,
         shape = CircleShape,
         modifier = if (onClick != null) Modifier.clip(CircleShape).clickable { onClick() } else Modifier
     ) {
@@ -1207,9 +1491,9 @@ fun StatPill(icon: ImageVector, count: Int, onClick: (() -> Unit)? = null) {
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(icon, contentDescription = null, tint = colors.onSurfaceVariant, modifier = Modifier.size(16.dp))
+            Icon(icon, contentDescription = null, tint = fg, modifier = Modifier.size(16.dp))
             Spacer(modifier = Modifier.width(6.dp))
-            Text(count.toString(), color = colors.onSurfaceVariant, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(label, color = fg, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
