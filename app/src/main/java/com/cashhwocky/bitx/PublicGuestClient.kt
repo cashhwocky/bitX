@@ -125,7 +125,7 @@ object PublicGuestClient {
                     val cleanTag = query.trim().removePrefix("#").replace(Regex("[^a-zA-Z0-9_]"), "")
                     if (cleanTag.isBlank()) return@withContext Result.success(emptyList())
                     val encoded = URLEncoder.encode(cleanTag, "UTF-8")
-                    "https://mastodon.social/api/v1/timelines/tag/$encoded?limit=40"
+                    "https://mastodon.social/api/v1/timelines/tag/$encoded?only_media=true&limit=40"
                 }
             }
 
@@ -181,3 +181,4 @@ object PublicGuestClient {
         }
     }
 }
+

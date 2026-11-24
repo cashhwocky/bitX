@@ -550,9 +550,14 @@ fun XNativeAuthScreen(
 fun NativeVideoPlayer(
     videoUrl: String,
     autoPlay: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isFullscreen: Boolean = false,
+    onRequestFullscreen: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var showFullscreenDialog by remember { mutableStateOf(false) }
+
     val exoPlayer = remember(videoUrl) {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
@@ -568,13 +573,42 @@ fun NativeVideoPlayer(
             }
     }
 
-    LaunchedEffect(autoPlay) {
-        exoPlayer.playWhenReady = autoPlay
+    LaunchedEffect(autoPlay, showFullscreenDialog) {
+        exoPlayer.playWhenReady = autoPlay && !showFullscreenDialog
     }
 
     DisposableEffect(videoUrl) {
         onDispose {
             exoPlayer.release()
+        }
+    }
+
+    if (showFullscreenDialog && !isFullscreen) {
+        Dialog(
+            onDismissRequest = { showFullscreenDialog = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+            ) {
+                NativeVideoPlayer(
+                    videoUrl = videoUrl,
+                    autoPlay = true,
+                    isFullscreen = true,
+                    modifier = Modifier.fillMaxSize()
+                )
+                FilledTonalIconButton(
+                    onClick = { showFullscreenDialog = false },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(16.dp)
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = "Exit Fullscreen")
+                }
+            }
         }
     }
 
@@ -592,18 +626,30 @@ fun NativeVideoPlayer(
                 }
             }
         )
-        Surface(
-            color = Color.Black.copy(alpha = 0.65f),
-            shape = CircleShape,
-            modifier = Modifier.align(Alignment.TopEnd).padding(10.dp)
+
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .then(if (isFullscreen) Modifier.windowInsetsPadding(WindowInsets.statusBars) else Modifier)
+                .padding(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(
-                "VIDEO",
-                color = Color.White,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Black,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-            )
+            FilledTonalIconButton(
+                onClick = { scope.launch { MediaDownloader.saveToGallery(context, videoUrl, isVideo = true) } },
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(Icons.Filled.Download, contentDescription = "Save Video", modifier = Modifier.size(18.dp))
+            }
+            if (!isFullscreen) {
+                FilledTonalIconButton(
+                    onClick = {
+                        if (onRequestFullscreen != null) onRequestFullscreen() else showFullscreenDialog = true
+                    },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(Icons.Filled.Fullscreen, contentDescription = "Fullscreen", modifier = Modifier.size(18.dp))
+                }
+            }
         }
     }
 }
@@ -613,6 +659,8 @@ fun ZoomableImageDialog(
     imageUrl: String,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
@@ -663,14 +711,21 @@ fun ZoomableImageDialog(
                     )
             )
 
-            FilledTonalIconButton(
-                onClick = onDismiss,
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .windowInsetsPadding(WindowInsets.statusBars)
-                    .padding(16.dp)
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(Icons.Filled.Close, contentDescription = "Close")
+                FilledTonalIconButton(
+                    onClick = { scope.launch { MediaDownloader.saveToGallery(context, imageUrl, isVideo = false) } }
+                ) {
+                    Icon(Icons.Filled.Download, contentDescription = "Save Image")
+                }
+                FilledTonalIconButton(onClick = onDismiss) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close")
+                }
             }
 
             Surface(
@@ -1691,3 +1746,4 @@ fun StatPill(
         }
     }
 }
+
