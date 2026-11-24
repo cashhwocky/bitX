@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -12,8 +12,24 @@ android {
         applicationId = "com.cashhwocky.bitx"
         minSdk = 31
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0.0-native"
+        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 3
+        versionName = "2.0.${System.getenv("GITHUB_RUN_NUMBER") ?: "0"}"
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("bitx.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildFeatures {
