@@ -473,6 +473,7 @@ fun BitXRoot() {
     var xAuthToken by remember { mutableStateOf(prefs.getString("auth_token", null)) }
     var xCt0 by remember { mutableStateOf(prefs.getString("ct0", null)) }
     var bskyJwt by remember { mutableStateOf(prefs.getString("bsky_jwt", null)) }
+    var bskyRefreshJwt by remember { mutableStateOf(prefs.getString("bsky_refresh_jwt", null)) }
     var bskyHandle by remember { mutableStateOf(prefs.getString("bsky_handle", null)) }
 
     var appStyle by remember {
@@ -512,6 +513,7 @@ fun BitXRoot() {
                     xAuthToken = xAuthToken,
                     xCt0 = xCt0,
                     bskyJwt = bskyJwt,
+                    bskyRefreshJwt = bskyRefreshJwt,
                     bskyHandle = bskyHandle,
                     appStyle = appStyle,
                     activeIcon = activeIcon,
@@ -544,13 +546,15 @@ fun BitXRoot() {
                         xCt0 = null
                     },
                     onSaveBskySession = { session ->
-                        prefs.edit().putString("bsky_jwt", session.accessJwt).putString("bsky_handle", session.handle).apply()
+                        prefs.edit().putString("bsky_jwt", session.accessJwt).putString("bsky_refresh_jwt", session.refreshJwt).putString("bsky_handle", session.handle.ifBlank { bskyHandle ?: "" }).apply()
                         bskyJwt = session.accessJwt
-                        bskyHandle = session.handle
+                        bskyRefreshJwt = session.refreshJwt
+                        if (session.handle.isNotBlank()) bskyHandle = session.handle
                     },
                     onLogoutBsky = {
-                        prefs.edit().remove("bsky_jwt").remove("bsky_handle").apply()
+                        prefs.edit().remove("bsky_jwt").remove("bsky_refresh_jwt").remove("bsky_handle").apply()
                         bskyJwt = null
+                        bskyRefreshJwt = null
                         bskyHandle = null
                     }
                 )
@@ -854,6 +858,7 @@ fun NativeBitXApp(
     xAuthToken: String?,
     xCt0: String?,
     bskyJwt: String?,
+    bskyRefreshJwt: String?,
     bskyHandle: String?,
     appStyle: AppStyle,
     activeIcon: AppIconOption,
@@ -936,7 +941,7 @@ fun NativeBitXApp(
             isLoading = true
             errorMsg = null
             val result = when (activeSource) {
-                FeedSource.BLUESKY -> BlueskyClient.fetchFeed(bskyJwt, tab, q)
+                FeedSource.BLUESKY -> BlueskyClient.fetchFeed(bskyJwt, bskyRefreshJwt, tab, q, onSaveBskySession)
                 FeedSource.X -> XApiClient.fetchFeed(xAuthToken, xCt0, tab, q)
                 FeedSource.PUBLIC -> PublicGuestClient.fetchFeed(tab, q, forceFresh = forceFresh)
             }
@@ -1002,6 +1007,8 @@ fun NativeBitXApp(
         CommentsScreen(
             parentTweet = activeCommentsTweet!!,
             bskyJwt = bskyJwt,
+            bskyRefreshJwt = bskyRefreshJwt,
+            onSaveBskySession = onSaveBskySession,
             appStyle = appStyle,
             allowNsfw = allowNsfw,
             savedIds = savedPosts.map { it.id }.toSet(),
@@ -1362,6 +1369,8 @@ fun NativeBitXApp(
 fun CommentsScreen(
     parentTweet: NativeTweet,
     bskyJwt: String?,
+    bskyRefreshJwt: String?,
+    onSaveBskySession: (BskySession) -> Unit,
     appStyle: AppStyle,
     allowNsfw: Boolean,
     savedIds: Set<String>,
@@ -1382,7 +1391,7 @@ fun CommentsScreen(
         errorMsg = null
         val res = when (parentTweet.source) {
             FeedSource.BLUESKY -> {
-                if (!bskyJwt.isNullOrBlank()) BlueskyClient.fetchReplies(bskyJwt, parentTweet.id)
+                if (!bskyJwt.isNullOrBlank()) BlueskyClient.fetchReplies(bskyJwt, bskyRefreshJwt, parentTweet.id, onSaveBskySession)
                 else Result.failure(Exception("Sign in to Bluesky to load replies."))
             }
             FeedSource.PUBLIC -> PublicGuestClient.fetchReplies(parentTweet.id)
@@ -1932,3 +1941,4 @@ fun StatPill(
         }
     }
 }
+

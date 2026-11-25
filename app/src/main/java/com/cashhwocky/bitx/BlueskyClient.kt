@@ -12,6 +12,7 @@ import java.net.URLEncoder
 
 data class BskySession(
     val accessJwt: String,
+    val refreshJwt: String,
     val handle: String
 )
 
@@ -42,12 +43,39 @@ object BlueskyClient {
                     return@withContext Result.failure(Exception("Bluesky login failed: $errMsg"))
                 }
                 val json = JSONObject(body)
-                val jwt = json.getString("accessJwt")
-                val handle = json.optString("handle", identifier)
-                Result.success(BskySession(jwt, handle))
+                Result.success(
+                    BskySession(
+                        accessJwt = json.getString("accessJwt"),
+                        refreshJwt = json.getString("refreshJwt"),
+                        handle = json.optString("handle", identifier)
+                    )
+                )
             }
         } catch (e: Exception) {
             Result.failure(e)
+        }
+    }
+
+    private fun refreshSessionSync(refreshJwt: String): BskySession? {
+        return try {
+            val req = Request.Builder()
+                .url("https://bsky.social/xrpc/com.atproto.server.refreshSession")
+                .post("".toRequestBody(null))
+                .header("Authorization", "Bearer $refreshJwt")
+                .header("User-Agent", UA)
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val json = JSONObject(resp.body?.string().orEmpty())
+                BskySession(
+                    accessJwt = json.getString("accessJwt"),
+                    refreshJwt = json.getString("refreshJwt"),
+                    handle = json.optString("handle", "")
+                )
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -63,7 +91,6 @@ object BlueskyClient {
 
         if (embed != null) {
             val embedType = embed.optString("\$type", "")
-            // Images
             val images = embed.optJSONArray("images")
                 ?: embed.optJSONObject("media")?.optJSONArray("images")
             if (images != null) {
@@ -74,7 +101,6 @@ object BlueskyClient {
                     if (full != null) mediaList.add(full)
                 }
             }
-            // Native Bluesky HLS Video
             val playlist = embed.optString("playlist").takeIf { it.isNotBlank() }
                 ?: embed.optJSONObject("media")?.optString("playlist")?.takeIf { it.isNotBlank() }
             if (playlist != null || embedType.contains("video")) {
@@ -84,7 +110,6 @@ object BlueskyClient {
                     ?: embed.optJSONObject("media")?.optString("thumbnail")?.takeIf { it.isNotBlank() }
                 if (thumb != null) mediaList.add(thumb)
             }
-            // External Link Card
             val ext = embed.optJSONObject("external")
             if (ext != null && videoUrl == null) {
                 val uri = ext.optString("uri").takeIf { it.isNotBlank() }
@@ -124,10 +149,49 @@ object BlueskyClient {
         )
     }
 
+    private fun executeAuthedGet(
+        url: String,
+        accessJwt: String,
+        refreshJwt: String?,
+        onSessionRefreshed: (BskySession) -> Unit
+    ): Result<String> {
+        fun callWith(token: String) = client.newCall(
+            Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/json")
+                .header("User-Agent", UA)
+                .build()
+        ).execute()
+
+        callWith(accessJwt).use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (resp.isSuccessful) return Result.success(body)
+
+            if ((resp.code == 400 || resp.code == 401) && !refreshJwt.isNullOrBlank()) {
+                val newSession = refreshSessionSync(refreshJwt)
+                if (newSession != null) {
+                    onSessionRefreshed(newSession)
+                    callWith(newSession.accessJwt).use { retryResp ->
+                        val retryBody = retryResp.body?.string().orEmpty()
+                        return if (retryResp.isSuccessful) {
+                            Result.success(retryBody)
+                        } else {
+                            Result.failure(Exception("Bluesky HTTP ${retryResp.code}: please sign in again"))
+                        }
+                    }
+                }
+            }
+            return Result.failure(Exception("Bluesky HTTP ${resp.code}: session expired (sign out & back in under Settings)"))
+        }
+    }
+
     suspend fun fetchFeed(
         accessJwt: String?,
+        refreshJwt: String?,
         tab: BitXTab,
-        query: String = ""
+        query: String = "",
+        onSessionRefreshed: (BskySession) -> Unit = {}
     ): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
             if (tab == BitXTab.SAVED) return@withContext Result.success(emptyList())
@@ -146,61 +210,49 @@ object BlueskyClient {
                 BitXTab.SAVED -> return@withContext Result.success(emptyList())
             }
 
-            val req = Request.Builder()
-                .url(url)
-                .header("Authorization", "Bearer $accessJwt")
-                .header("Accept", "application/json")
-                .header("User-Agent", UA)
-                .build()
+            val bodyRes = executeAuthedGet(url, accessJwt, refreshJwt, onSessionRefreshed)
+            if (bodyRes.isFailure) return@withContext Result.failure(bodyRes.exceptionOrNull()!!)
 
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    return@withContext Result.failure(Exception("Bluesky HTTP ${resp.code}: session may have expired"))
+            val root = JSONObject(bodyRes.getOrThrow())
+            val list = mutableListOf<NativeTweet>()
+            if (tab == BitXTab.HOME) {
+                val feed = root.optJSONArray("feed") ?: JSONArray()
+                for (i in 0 until feed.length()) {
+                    val post = feed.optJSONObject(i)?.optJSONObject("post") ?: continue
+                    parsePostObj(post, "bsky_$i")?.let { list.add(it) }
                 }
-                val root = JSONObject(body)
-                val list = mutableListOf<NativeTweet>()
-                if (tab == BitXTab.HOME) {
-                    val feed = root.optJSONArray("feed") ?: JSONArray()
-                    for (i in 0 until feed.length()) {
-                        val post = feed.optJSONObject(i)?.optJSONObject("post") ?: continue
-                        parsePostObj(post, "bsky_$i")?.let { list.add(it) }
-                    }
-                } else {
-                    val posts = root.optJSONArray("posts") ?: JSONArray()
-                    for (i in 0 until posts.length()) {
-                        val post = posts.optJSONObject(i) ?: continue
-                        parsePostObj(post, "bsky_s_$i")?.let { list.add(it) }
-                    }
+            } else {
+                val posts = root.optJSONArray("posts") ?: JSONArray()
+                for (i in 0 until posts.length()) {
+                    val post = posts.optJSONObject(i) ?: continue
+                    parsePostObj(post, "bsky_s_$i")?.let { list.add(it) }
                 }
-                Result.success(list)
             }
+            Result.success(list)
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    suspend fun fetchReplies(accessJwt: String, postUri: String): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
+    suspend fun fetchReplies(
+        accessJwt: String,
+        refreshJwt: String?,
+        postUri: String,
+        onSessionRefreshed: (BskySession) -> Unit = {}
+    ): Result<List<NativeTweet>> = withContext(Dispatchers.IO) {
         try {
             val encoded = URLEncoder.encode(postUri, "UTF-8")
-            val req = Request.Builder()
-                .url("https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=$encoded&depth=2")
-                .header("Authorization", "Bearer $accessJwt")
-                .header("Accept", "application/json")
-                .header("User-Agent", UA)
-                .build()
+            val url = "https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=$encoded&depth=2"
+            val bodyRes = executeAuthedGet(url, accessJwt, refreshJwt, onSessionRefreshed)
+            if (bodyRes.isFailure) return@withContext Result.failure(bodyRes.exceptionOrNull()!!)
 
-            client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) return@withContext Result.failure(Exception("Replies HTTP ${resp.code}"))
-                val replies = JSONObject(body).optJSONObject("thread")?.optJSONArray("replies") ?: JSONArray()
-                val list = mutableListOf<NativeTweet>()
-                for (i in 0 until replies.length()) {
-                    val post = replies.optJSONObject(i)?.optJSONObject("post") ?: continue
-                    parsePostObj(post, "bsky_r_$i")?.let { list.add(it) }
-                }
-                Result.success(list)
+            val replies = JSONObject(bodyRes.getOrThrow()).optJSONObject("thread")?.optJSONArray("replies") ?: JSONArray()
+            val list = mutableListOf<NativeTweet>()
+            for (i in 0 until replies.length()) {
+                val post = replies.optJSONObject(i)?.optJSONObject("post") ?: continue
+                parsePostObj(post, "bsky_r_$i")?.let { list.add(it) }
             }
+            Result.success(list)
         } catch (e: Exception) {
             Result.failure(e)
         }
